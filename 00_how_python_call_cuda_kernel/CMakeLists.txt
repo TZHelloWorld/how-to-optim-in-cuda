@@ -62,38 +62,10 @@ endif()
 # 查找 Python 解释器和开发组件
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
-# 这个主要是针对 Linux 上多个 python 版本导致的多个 pybind11 出现的问题进行修复：
-# ==============================================================================================
-# 根据 $(python3 -m pybind11 --includes) 动态获取 pybind11 的包含路径, 即优先使用 pip 安装的 pybind 
-# 而不是优先使用 CMake 的 find_package 配置（系统中通过 apt 或 yum 安装了 pybind11-dev）
-execute_process( # 用于运行 Python 命令，动态获取 pybind11 的包含路径；
-    COMMAND ${Python_EXECUTABLE} -m pybind11 --includes
-    OUTPUT_VARIABLE PYBIND11_INCLUDE_OUTPUT
-    ERROR_VARIABLE PYBIND11_INCLUDE_ERROR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE PYBIND11_CONFIG_RESULT
-)
-
-if(NOT PYBIND11_CONFIG_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to get pybind11 include paths: ${PYBIND11_INCLUDE_ERROR}")
-endif()
-
-# 解析输出中的 -I 路径
-string(REGEX MATCHALL "-I([^ ]+)" PYBIND11_INCLUDE_FLAGS ${PYBIND11_INCLUDE_OUTPUT})
-set(PYBIND11_INCLUDE_DIRS "")
-foreach(flag ${PYBIND11_INCLUDE_FLAGS})
-    string(SUBSTRING ${flag} 2 -1 dir)
-    list(APPEND PYBIND11_INCLUDE_DIRS ${dir})
-endforeach()
-
-# 添加 pybind11 的包含路径
-include_directories(${PYBIND11_INCLUDE_DIRS})
-
-message(STATUS "add include dirctories dir: ${PYBIND11_INCLUDE_DIRS}")
-# ==============================================================================================
-
 # 查找 pybind11 包
-find_package(pybind11 CONFIG REQUIRED)
+# find_package(pybind11 CONFIG REQUIRED)
+# 用找到 Python 包的站点路径作为提示查找 pybind11 (如果Linux 上有多个pybind11，优先使用 pip 安装的 pybind 路径下的)
+find_package(pybind11 REQUIRED HINTS "${Python_SITELIB}")
 
 # 添加 CUDA 文件并创建共享库
 add_library(cuda_functions SHARED src/cuda_hello.cu)

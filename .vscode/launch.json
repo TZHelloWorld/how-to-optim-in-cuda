@@ -15,7 +15,7 @@
             "name": "CUDA GDB Server: Launch",
             "type": "cuda-gdb",
             "request": "launch",
-            "program": "path/to/python", // 修改为Python路径 which python or where python 
+            "program": "/home/tz/miniconda3/envs/tz_llm/bin/python", // 修改为Python路径 which python or where python 
             "args": [
                 "${file}"
             ],
