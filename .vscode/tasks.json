@@ -7,12 +7,12 @@
 			"type": "shell",  // 任务执行的是shell命令，也可以是其他
 			"command": "bash", // 执行命令是 bash
 			"args": [
-				
-				"'${file}'", //当前文件名
+				"'${file}'", //当前文件名,
 			],
 			"problemMatcher": [],
 			"detail": "CMake 模板 安装 任务",
 			"group": {
+				// 任务分组，因为是tasks而不是task，意味着可以连着执行很多任务
 				"kind": "build",
 				"isDefault": true
 			}
