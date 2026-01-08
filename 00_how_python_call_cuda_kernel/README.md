@@ -169,8 +169,11 @@ print(example.add(1,2)) # ===> 输出结果为 103 (1+2+100)
         |          ^~~~~~~~~~
     compilation terminated.
     ```
-2.  为了能够让 `python` 能够导入生成的 `.so` 文件，需要确保 `pybind11` 配置的 `module` 名字和 `.so` 文件的模块名字一样。如错误示例：
+
+2.  为了能够让 `python` 能够导入生成的 `.so` 文件，需要确保 `pybind11` 配置的 `module` 名字和 `.so` 文件的模块名字一样。比如错误示例有：
+
     ```bash
+    # 名字由 example 换成了 demo
     >>> c++ -O3 -Wall -shared -std=c++11 -fPIC $(python3 -m pybind11 --includes) example.cpp -o demo$(python3-config --extension-suffix)
 
     # 查看内容 demo.xxx.so 名字和 PyInit_example 中不一致
@@ -202,7 +205,7 @@ print(example.add(1,2)) # ===> 输出结果为 103 (1+2+100)
     >>> echo $(python -m pybind11 --includes)
         -I/usr/include/python3.12 -I/usr/local/lib/python3.12/dist-packages/pybind11/include
 
-    # 生成的却是 3.10 的 .so 文件
+    # 生成的却是 3.10 的 .so 文件命名
     >>> echo example$(python3-config --extension-suffix)
         example.cpython-310-x86_64-linux-gnu.so
     ```
@@ -260,10 +263,11 @@ print(example.run())
 ```
 
 ### 注意
-上述中有个 `CUDA Launch` 检错逻辑。如果不添加这些功能，可能会导致编译通过，运行通过，但是 `cuda kernel` 没执行。如：上述代码删除掉检测代码,进行编译：
+上述中有个 `CUDA Launch` 检错逻辑。如果不添加这些功能，可能会导致编译通过，运行通过，但是 `cuda kernel` 实际上却没执行。如：上述代码删除掉检测代码后, 进行编译：
 ```bash
 >>> nvcc -arch=sm_90 --shared -Xcompiler -fPIC -Xcompiler $(python3 -m pybind11 --includes)  -o example$(python3-config --extension-suffix) example.cu
 
+# 借助 ipython 工具实时进行调试
 >>> python -m IPython
 Python 3.10.12 (main, Aug 15 2025, 14:32:43) [GCC 11.4.0]
 Type 'copyright', 'credits' or 'license' for more information
@@ -293,7 +297,9 @@ CUDA launch error: no kernel image is available for execution on the device
     }                                             \
 } while(0)
 ```
-检测代码有：
+
+于是添加检错代码的 `cuda` 代码就有：
+
 ```c++
 // 核函数定义，定义每个 thread 干什么
 __global__ void demo_kernel(){
@@ -311,6 +317,7 @@ void launch_kernel() {
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 ```
+
 
 ## `pytorch` 扩展
 
@@ -383,6 +390,9 @@ hello,world!!!
 ```
 
 （其实就是将编译过程自动化了，无需自己去 `nvcc xxx` 了）根据提示内容，会在 `/root/.cache/torch_extensions/py310_cu126/example`目录下构建,如果退出，文件依然存在，但是再次想调用，需要设置环境变量，否则找不到该 `module`
+
+# CMake 构建自动化
+
 
 
 # vscode 调试
