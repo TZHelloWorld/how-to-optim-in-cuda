@@ -1,0 +1,21 @@
+{
+	// https://code.visualstudio.com/docs/editor/tasks
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build", // 任务的名字叫 Build，注意是大小写区分的，等会在 launch.json 中的 preLaunchTask 调用这个名字
+			"type": "shell",  // 任务执行的是shell命令，也可以是其他
+			"command": "bash", // 执行命令是 bash
+			"args": [
+				
+				"'${file}'", //当前文件名
+			],
+			"problemMatcher": [],
+			"detail": "CMake 模板 安装 任务",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	]
+}

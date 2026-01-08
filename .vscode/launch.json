@@ -1,0 +1,35 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [ // 配置调试器相关参数，包括 python 调试器， cuda-gdb 调试器参数
+        {
+            "name": "Python: Launch",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "CUDA GDB Server: Launch",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "path/to/python", // 修改为Python路径 which python or where python 
+            "args": [
+                "${file}"
+            ],
+            "debuggerPath": "/usr/local/cuda/bin/cuda-gdb", // 确认 cuda-gdb 路径正确
+        }
+    ],
+    "compounds": [ // 将两个调试器配置组装成一个， 在调试的时候同事启动这两个调试器
+        {
+            "name": "Python and CUDA",
+            "preLaunchTask": "Build",  //在launch之前运行的任务名，这个名字一定要跟 tasks.json 中的任务名字大小写一致
+            "configurations": [
+                "Pybathon: Launch",
+                "CUDA GDB Server: Launch"
+            ]
+        }
+    ]
+}
