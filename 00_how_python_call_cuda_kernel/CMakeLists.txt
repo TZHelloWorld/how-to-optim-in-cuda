@@ -1,8 +1,8 @@
 # 设置 CMake 的最低版本要求
 cmake_minimum_required(VERSION 3.18)
 
-# 设置构建类型为 Debug
-set(CMAKE_BUILD_TYPE Debug)
+# 安全设置构建类型（支持用户显式覆盖）
+set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 
 # 设置 CUDA 主机编译器为 g++
 set(CMAKE_CUDA_HOST_COMPILER /usr/bin/g++)
@@ -76,6 +76,7 @@ set_target_properties(cuda_functions PROPERTIES CUDA_ARCHITECTURES ${CUDA_ARCHIT
 # 如果是 Debug 模式，为 CUDA 编译器添加调试选项
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(cuda_functions PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G -g>)
+    add_compile_options(-g)  # 为 C++ 编译器（g++）启用调试符号
 endif()
 
 # 创建 pybind11 模块
