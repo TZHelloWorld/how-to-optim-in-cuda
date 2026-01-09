@@ -2,7 +2,17 @@
 
 # CUDA Hello World 构建脚本
 
+# 获取脚本所在目录的绝对路径
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# 设置构建类型（默认为 Release）
+BUILD_TYPE="Release"
+if [ "$1" == "debug" ]; then
+    BUILD_TYPE="Debug"
+fi
+
 echo "构建CUDA共享库..."
+echo "构建类型: $BUILD_TYPE"
 
 # 检查依赖
 echo "检查依赖..."
@@ -18,16 +28,17 @@ fi
 
 # 清理旧的构建
 echo "清理旧的构建文件..."
-rm -rf build
-# rm -f python/*.so
+rm -rf "${SCRIPT_DIR}/build"
 
 # 创建构建目录
-mkdir -p build
-cd build
+mkdir -p "${SCRIPT_DIR}/build"
+cd "${SCRIPT_DIR}/build" || { echo "无法进入构建目录"; exit 1; }
 
-# 配置CMake
-echo "配置CMake..."
-cmake ..
+
+
+# 配置 CMake
+echo "配置 CMake..."
+cmake -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" "${SCRIPT_DIR}"
 
 if [ $? -ne 0 ]; then
     echo "CMake配置失败"
@@ -47,7 +58,7 @@ fi
 # echo "复制共享库到python目录..."
 # cp libcuda_functions.so ../python/
 
-cd ..
+cd "${SCRIPT_DIR}"
 
 echo "构建完成!"
 echo ""

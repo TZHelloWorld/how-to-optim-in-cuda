@@ -6,7 +6,7 @@ cd how-to-optim-in-cuda/00_how_python_call_cuda_kernel
 # 确保是通过运行 python 安装的 pybind11
 python -m pip install pybind11
 
-# 编译 c++ 和 cuda kernel
+# 编译 c++ 和 cuda kernel。 如果要调试debug ,执行 bash build.sh debug
 bash build.sh
 
 # 执行
