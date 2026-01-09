@@ -1,4 +1,7 @@
 # 运行
+
+如果只是单纯的运行，则参考：
+
 ```bash
 git clone https://github.com/TZHelloWorld/how-to-optim-in-cuda.git
 cd how-to-optim-in-cuda/00_how_python_call_cuda_kernel
@@ -6,11 +9,54 @@ cd how-to-optim-in-cuda/00_how_python_call_cuda_kernel
 # 确保是通过运行 python 安装的 pybind11
 python -m pip install pybind11
 
-# 编译 c++ 和 cuda kernel。 如果要调试debug ,执行 bash build.sh debug
+# 编译 c++ 和 cuda kernel
 bash build.sh
 
 # 执行
 python python/test_cuda_hello.py
+```
+
+调试运行：
+
+```bash
+git clone https://github.com/TZHelloWorld/how-to-optim-in-cuda.git
+cd how-to-optim-in-cuda/00_how_python_call_cuda_kernel
+
+# 确保是通过运行 python 安装的 pybind11
+python -m pip install pybind11 ipdb
+
+# 添加调试信息到编译文件中
+bash build.sh debug
+
+# 测试执行情况：
+python python/test_cuda_hello.py
+
+# 使用 cuda-gdb + ipdb 进行调试
+cuda-gdb python --quiet
+```
+
+此时需要交互操作：
+
+```bash
+# 给 kernel 打断点
+(cuda-gdb) break cuda_hello_kernel
+Function "cuda_hello_kernel" not defined.
+Make breakpoint pending on future shared library load? (y or [n]) y
+Breakpoint 1 (cuda_hello_kernel) pending.
+
+(cuda-gdb) run -m ipdb python/test_cuda_hello.py 
+Starting program: /usr/bin/python -m ipdb python/test_cuda_hello.py
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+<frozen runpy>:128: RuntimeWarning: 'ipdb.__main__' found in sys.modules after import of package 'ipdb', but prior to execution of 'ipdb.__main__'; this may result in unpredictable behaviour
+[New Thread 0x7ffff5838640 (LWP 4291)]
+> /xxx/xxx/how-to-optim-in-cuda/00_how_python_call_cuda_kernel/python/test_cuda_hello.py(1)<module>()
+----> 1 """
+      2 测试CUDA Hello World模块
+      3 """
+
+[New Thread 0x7ffff4ce3640 (LWP 4292)]
+ipdb>
 ```
 
 # 说明
@@ -590,6 +636,7 @@ python -m ipdb matrix_add.py
 - **exit**:
 
 除此之外，当到达断点的时候可以查看：
+
 ```python
 
 locals() 
@@ -775,7 +822,7 @@ Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
 /usr/lib/python3.10/runpy.py:126: RuntimeWarning: 'ipdb.__main__' found in sys.modules after import of package 'ipdb', but prior to execution of 'ipdb.__main__'; this may result in unpredictable behaviour
   warn(RuntimeWarning(msg))
 [New Thread 0x7ffff5893640 (LWP 21255)]
-> /home/work/tz/ncu/python-cuda-gdb/example/test2/how-to-optim-in-cuda/tz/test.py(1)<module>()
+> /xxx/xxx/test.py(1)<module>()
 ----> 1 import example
       2 print(example.run())
 
