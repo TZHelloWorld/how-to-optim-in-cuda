@@ -60,7 +60,17 @@ ipdb>
 ```
 
 # 说明
-其实可以理解为一种 `python ---> pybind11 ---> C/C++ ---> CUDA Kernel` 的调用逻辑。
+
+其实可以理解为一种 `python ---> pybind11 ---> C/C++ ---> CUDA Kernel` 的调用逻辑。`Pybind` 是一个用于将 `C++` 代码与 `Python` 解释器集成的库，实现原理是通过将 `C++` 代码编译成动态链接库（`DLL`）或共享对象（`SO`）文件，使用 `Pybind` 提供的 `API` 将算子核函数与 `Python` 解释器进行绑定。在 `Python` 解释器中使用绑定的 `C++` 函数、类和变量，从而实现 `Python` 与 `C++` 代码的交互。
+
+对于 `python/C++` 混合代码编程(一般代指 `python` 调用 `C++` 程序)，基本依靠 `pybind11` 。一般在 `C++` 代码层面编写 `C++` 执行代码以及 `pybind11` 绑定逻辑代码，之后通过编译生成对应的`.so` 文件。之后就可以通过 `python` 的 `import` 功能导入对应的模块，并调用对应的函数。这里有几个点：
+1. 如果C++代码层面不编写pybind11绑定逻辑，通过gcc编译是可以通过的（编写 `setup.py` 来编译都行，这种方式被称为 `ahead of time`），但是在通过 `python` 导入的时候找不到而已，版本高的 `python` 解释器可能提示`dynamic module does not define module export function (PyInit_example)`
+2. pytorch中的[torch-utils-cpp-extension](https://pytorch.ac.cn/docs/stable/cpp_extension.html)的 [load()](https://pytorch.ac.cn/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load) 函数(这种方式被称为`just in time`)可以即时编译并加载cpp的扩展，其会调用 `Ninja` 构建文件，并在一个临时目录中构建并编译生成`.so`
+
+关于 `pybind11` 的参考资料直接看官方文档：
+
+* [pybind11官方文档](https://pybind11.readthedocs.io/en/stable/)
+* [pybind11中文翻译](https://github.com/charlotteLive/pybind11-Chinese-docs.git)
 
 ## 关于 `C/C++ ---> CUDA Kernel` 的调用
 
@@ -127,8 +137,12 @@ c++ -O3 -Wall -shared -std=c++11 -fPIC $(python3 -m pybind11 --includes) example
 <summary></summary>
 说明：
 
-- `--shared` 表示要求生成 **共享库**（`Shared Library`）
-- `-fPIC` 表示要求生成 **位置无关代码**（`Position Independent Code`），这是共享库的必要条件。
+- `c++` 表示使用 `c++` 编译器；
+- `-O3` 表示启用优化等级 3，通常这是最高级别的优化，能最大化编译代码的执行效率；
+- `-Wall` 表示启用所有警告信息；
+- `--shared` 表示指示编译器生成一个**共享库**（动态链接库，`Shared Library`）；
+- `-std=c++11` 表示指定使用 `C++11` 标准来编译代码;
+- `-fPIC` 表示要求生成 **位置无关代码**（`Position Independent Code`），这是共享库的必要条件。为了生成共享库时能在内存中的任何位置加载，而不会因为地址的不同而导致问题。
 - `python3 -m pybind11 --includes` :查看对应的 `python` 依赖库头文件地址, 内容为 `-I/usr/xxx/xxx` 路径，用于指定头文件的搜索路径（`Include Path`），就是告诉编译器，需要在该路径下查找头文件。
 - `example$(python3-config --extension-suffix)`: 如果使用 `pybind11` 作为 `python` 和 `c++` 的胶水，则编译的 `.so` 需要满足 `[module_name].cpythono-[version]-x86_64-linux-gnu.so` 的命名规则。才会被 `python` 程序导入。
 </details>
@@ -297,6 +311,78 @@ void launch_kernel() {
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 ```
+
+## `pytorch` 扩展
+
+参考[torch-utils-cpp-extension](https://pytorch.ac.cn/docs/stable/cpp_extension.html) 的 [load()](https://pytorch.ac.cn/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load) 函数可以即时编译(可以少了自己手动编译链接的过程)：
+
+创建一个 `example.cu` 文件，文件内容为：
+```c++
+#include <stdio.h>
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
+
+// 核函数定义，定义每个 thread 干什么
+__global__ void demo_kernel(){
+    printf("hello,world!!! \n\n");
+}
+
+// 封装 CUDA 调用的函数
+void launch_kernel() {
+    cudaError_t err; 
+    
+    demo_kernel<<<1,1>>>();
+    err = cudaGetLastError(); // 执行kernel launch 之后判断
+    if (err != cudaSuccess) {
+        printf("CUDA launch error: %s\n", cudaGetErrorString(err));
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("CUDA DeviceSynchronize error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// pybind11 模块定义
+PYBIND11_MODULE(example, m) {
+    m.def("run", &launch_kernel, "Launch the CUDA kernel");
+}
+```
+
+在 `python` 文件中，内容入下：
+
+```python
+from torch.utils.cpp_extension import load
+# 调用 Ninja 去编译构建.so文件，并通过传参 verbose=True输出构建过程
+cppcuda_tutorial = load(name="example",
+                        # extra_include_paths=include_dirs,
+                        sources=['example.cpp'],
+                        verbose=True)
+
+cppcuda_tutorial.run() # 调用
+```
+
+输出内容如下：
+
+```bash
+Using /root/.cache/torch_extensions/py310_cu126 as PyTorch extensions root...
+Creating extension directory /root/.cache/torch_extensions/py310_cu126/example...
+Detected CUDA files, patching ldflags
+Emitting ninja build file /root/.cache/torch_extensions/py310_cu126/example/build.ninja...
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Building extension module example...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output example.cuda.o.d -DTORCH_EXTENSION_NAME=example -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /usr/local/lib/python3.10/dist-packages/torch/include -isystem /usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /usr/include/python3.10 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_80,code=compute_80 -gencode=arch=compute_80,code=sm_80 --compiler-options '-fPIC' -std=c++17 -c /home/work/tz/ncu/python-cuda-gdb/test2/example.cu -o example.cuda.o 
+[2/2] c++ example.cuda.o -shared -L/usr/local/lib/python3.10/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o example.so
+Loading extension module example...
+
+hello,world!!! 
+```
+
+（其实就是将编译过程自动化了，无需自己去 `nvcc xxx` 了）根据提示内容，会在 `/root/.cache/torch_extensions/py310_cu126/example`目录下构建,如果退出，文件依然存在，但是再次想调用，需要设置环境变量，否则找不到该 `module`
 
 
 # vscode 调试
@@ -540,20 +626,18 @@ CUDA thread hit Breakpoint 1.2, matrixAdd<<<(64,64,1),(16,16,1)>>> (A=0x7fffb360
 (cuda-gdb) cuda kernel grid sm warp lane device block thread
 kernel 0, grid 1, block (44,1,0), thread (3,4,0), device 0, sm 1, warp 2, lane 3
 
-# 切换到其他坐标（好像得分开切换，否则会提示 Invalid coordinates requested. CUDA focus unchanged.）
-# 先查看下能切换到哪些：
 # 直接一下切换，（推荐分开切换，否则很容易提示 Invalid coordinates requested. CUDA focus unchanged. ）
 (cuda-gdb) cuda kernel 0 grid 1 block (44,1,0) thread (3,4,0) device 0 sm 1 warp 2 lane 3
 [Switching focus to CUDA kernel 0, grid 1, block (44,1,0), thread (3,4,0), device 0, sm 1, warp 2, lane 3]
 7	    int row = blockIdx.y * blockDim.y + threadIdx.y;
 
 
-# 先切换 grid block thread
+# (分开切换)先切换 grid block thread
 (cuda-gdb) cuda device 0 grid 1 block (49,6,0) thread (15,5,0)
 [Switching focus to CUDA kernel 0, grid 1, block (49,6,0), thread (15,5,0), device 0, sm 0, warp 43, lane 31]
 0x00007fffcf26a8e0	5	__global__ void matrixAdd(int* A, int* B, int* C, int width) {
 
-# 然后切换其中的 sm warp lane 等等，不确定是否可以一起切换。
+# (分开切换)然后切换其中的 sm warp lane 等等。
 (cuda-gdb) cuda kernel 0 sm 2 warp 43 lane 16
 [Switching focus to CUDA kernel 0, grid 1, block (51,6,0), thread (0,5,0), device 0, sm 2, warp 43, lane 16]
 7	    int row = blockIdx.y * blockDim.y + threadIdx.y;
