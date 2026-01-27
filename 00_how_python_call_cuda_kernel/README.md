@@ -364,7 +364,7 @@ from torch.utils.cpp_extension import load
 # 调用 Ninja 去编译构建.so文件，并通过传参 verbose=True输出构建过程
 cppcuda_tutorial = load(name="example",
                         # extra_include_paths=include_dirs,
-                        sources=['example.cpp'],
+                        sources=['example.cu'],
                         verbose=True)
 
 cppcuda_tutorial.run() # 调用
@@ -389,7 +389,41 @@ Loading extension module example...
 hello,world!!! 
 ```
 
-（其实就是将编译过程自动化了，无需自己去 `nvcc xxx` 了）根据提示内容，会在 `/root/.cache/torch_extensions/py310_cu126/example`目录下构建,如果退出，文件依然存在，但是再次想调用，需要设置环境变量，否则找不到该 `module`
+（其实就是将编译过程自动化了，无需自己去 `nvcc xxx` 了）根据提示内容，会在 `/root/.cache/torch_extensions/py310_cu126/example`目录下构建（这个编译目录可通过环境变量 `TORCH_EXTENSIONS_DIR` 来设置）,如果退出，文件依然存在。如果不修改代码，再次调用则不会重新再编译：
+
+```python
+from torch.utils.cpp_extension import load
+# 调用 Ninja 去编译构建.so文件，并通过传参 verbose=True输出构建过程
+cppcuda_tutorial = load(name="example",
+                        # extra_include_paths=include_dirs,
+                        sources=['example.cu'],
+                        verbose=True)
+
+cppcuda_tutorial.run() # 调用
+```
+
+输出内容如下：
+
+```bash
+Using /root/.cache/torch_extensions/py310_cu126 as PyTorch extensions root...
+Detected CUDA files, patching ldflags
+Emitting ninja build file /root/.cache/torch_extensions/py310_cu126/example/build.ninja...
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Building extension module example...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+ninja: no work to do.
+Loading extension module example...
+
+hello,world!!! 
+```
+
+除此之外，整个扩展内容可以参考 [PyTorch 自定义运算符](https://docs.pytorch.org/tutorials/advanced/custom_ops_landing_page.html)
+
+todo..
+
+
 
 # CMake 构建自动化
 
@@ -529,8 +563,7 @@ Reading symbols from ./matrix_add...
 (cuda-gdb) 
 ```
 
-然后就可以开始调试了，具体的操作可以参考 [CUDA-GDB 官网](https://docs.nvidia.com/cuda/cuda-gdb/index.html#compiling-the-application)，常用的操作如下：
-
+ 
 ```bash
 # 查看设置
 (cuda-gdb) help set cuda
