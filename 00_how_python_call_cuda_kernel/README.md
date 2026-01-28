@@ -319,7 +319,47 @@ void launch_kernel() {
 ```
 
 
-## `pytorch` 扩展
+## `pytorch` 自定义运算符
+
+> 大部分内容参考 [PyTorch 自定义运算符](https://docs.pytorch.org/tutorials/advanced/custom_ops_landing_page.html)
+
+如果希望将新的自定义操作（算子）引入 `PyTorch`，并使其能够与 `torch.compile`、`autograd` 和 `torch.vmap` 等子系统协同工作。那么就必须通过 `Python` 的 [torch.library](https://docs.pytorch.org/docs/stable/library.html#module-torch.library) 或 `C++` 的 [TORCH_LIBRARY](https://docs.pytorch.org/cppdocs/library.html#torch-library-api) 将自定义操作注册到 `PyTorch` 中。
+
+- 使用 [torch.library.custom_op()](https://docs.pytorch.org/docs/stable/library.html#torch.library.custom_op) 创建 `Python` 自定义运算符。
+  - 将任意 `Python` 函数视为不透明可调用对象(如防止 `torch.compile` 追踪到该函数内部，减少发生 `图中断` 的现象)
+  - 为任意 `Python` 函数添加训练支持(`torch.library.register_autograd`)
+- `C++/CUDA` 编写自定义操作符,并注册为 `PyTorch` 运算符（也可以将其独立编成一个`wheel`,使用 `pybind11` 对外暴露）
+  - 编译：使用 [torch.utils.cpp_extension](https://docs.pytorch.org/docs/stable/cpp_extension.html#torch-utils-cpp-extension) 编译自定义 `C++/CUDA` 代码以供 `PyTorch` 使用。
+  - 定义自定义运算符：通过宏定义（`Macros`）[TORCH_LIBRARY](https://docs.pytorch.org/cppdocs/library.html#library_8h_1a0bd5fb09d25dfb58e750d712fc5afb84)进行注册（一个命名空间只能注册一个 `TORCH_LIBRARY`）。如下所示，该运算符可以通过 `Python` 访问，路径为 `torch.ops.myops.mymuladd`
+    ```c++
+    // myops 是 命名空间，m 是 torch::Library 类型。
+    TORCH_LIBRARY(myops, m) {
+        // Note that "float" in the schema corresponds to the C++ double type
+        // and the Python float type.
+        m.def("mymuladd(Tensor a, Tensor b, float c) -> Tensor");
+    }
+    ```
+  - 注册后端实现：通过宏定义（`Macros`）[TORCH_LIBRARY_IMPL](https://docs.pytorch.org/cppdocs/library.html#library_8h_1a800b28569c0f7d0d9732bf8b6342d9f3)进行注册。为不同的后端（`CPU`、`CUDA`等等）绑定具体的执行函数。（一个命名空间可以注册多个 `TORCH_LIBRARY_IMPL`）
+    ```c++
+    // 给命名空间 myops 的 CPU 后端绑定函数
+    TORCH_LIBRARY_IMPL(myops, CPU, m) {
+        // m is a torch::Library; methods on it will define
+        // CPU implementations of operators in the myops namespace.
+        // It is NOT valid to call torch::Library::def()
+        // in this context.
+        m.impl("mymuladd", &mymuladd_cpu);
+    }
+
+    // 给命名空间 myops 的 CUDA 后端绑定函数
+    TORCH_LIBRARY_IMPL(myops, CUDA, m) {
+        m.impl("mymuladd", &mymuladd_cuda);
+    }
+    ```
+    > 在 `pytorch2.9` 版本后中有个 [Troch Stable API](https://docs.pytorch.org/cppdocs/stable.html) 的接口。包含 `STABLE_TORCH_LIBRARY`、`STABLE_TORCH_LIBRARY_IMPL`、`STABLE_TORCH_LIBRARY_FRAGMENT` 相关注册的内容。
+
+
+
+### 通过 `torch.utils.cpp_extension.load()` + `pybind11` 即时编译
 
 参考[torch-utils-cpp-extension](https://pytorch.ac.cn/docs/stable/cpp_extension.html) 的 [load()](https://pytorch.ac.cn/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load) 函数可以即时编译(可以少了自己手动编译链接的过程)：
 
@@ -419,10 +459,11 @@ Loading extension module example...
 hello,world!!! 
 ```
 
-除此之外，整个扩展内容可以参考 [PyTorch 自定义运算符](https://docs.pytorch.org/tutorials/advanced/custom_ops_landing_page.html)
+### 使用 `setuptools`（`setup.py`） 提前编译
 
-todo..
+> 可以参考 [C++/CUDA Extensions in PyTorch](https://github.com/pytorch/extension-cpp)
 
+todo... 
 
 
 # CMake 构建自动化
