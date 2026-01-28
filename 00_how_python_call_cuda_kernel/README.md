@@ -63,9 +63,10 @@ ipdb>
 
 其实可以理解为一种 `python ---> pybind11 ---> C/C++ ---> CUDA Kernel` 的调用逻辑。`Pybind` 是一个用于将 `C++` 代码与 `Python` 解释器集成的库，实现原理是通过将 `C++` 代码编译成动态链接库（`DLL`）或共享对象（`SO`）文件，使用 `Pybind` 提供的 `API` 将算子核函数与 `Python` 解释器进行绑定。在 `Python` 解释器中使用绑定的 `C++` 函数、类和变量，从而实现 `Python` 与 `C++` 代码的交互。
 
-对于 `python/C++` 混合代码编程(一般代指 `python` 调用 `C++` 程序)，基本依靠 `pybind11` 。一般在 `C++` 代码层面编写 `C++` 执行代码以及 `pybind11` 绑定逻辑代码，之后通过编译生成对应的`.so` 文件。之后就可以通过 `python` 的 `import` 功能导入对应的模块，并调用对应的函数。这里有几个点：
-1. 如果C++代码层面不编写pybind11绑定逻辑，通过gcc编译是可以通过的（编写 `setup.py` 来编译都行，这种方式被称为 `ahead of time`），但是在通过 `python` 导入的时候找不到而已，版本高的 `python` 解释器可能提示`dynamic module does not define module export function (PyInit_example)`
-2. pytorch中的[torch-utils-cpp-extension](https://pytorch.ac.cn/docs/stable/cpp_extension.html)的 [load()](https://pytorch.ac.cn/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load) 函数(这种方式被称为`just in time`)可以即时编译并加载cpp的扩展，其会调用 `Ninja` 构建文件，并在一个临时目录中构建并编译生成`.so`
+对于 `python/C++` 混合代码编程(一般代指 `python` 调用 `C++` 程序)，基本依靠 `pybind11` （或`Python` 的 `C/C++` 扩展模块机制，这里以 `pybind11` 举例说明）。一般在 `C++` 代码层面编写 `C++` 执行代码以及 `pybind11` 绑定逻辑代码，之后通过编译生成对应的`.so` 文件。之后就可以通过 `python` 的 `import` 功能导入对应的模块，并调用对应的函数。这里有几个点：
+1. **`pybind11`**:如果 `C++` 代码层面不编写 `pybind11` 绑定逻辑，通过 `gcc` 编译是可以通过的（编写 `setup.py` 来编译都行，这种方式被称为 `ahead of time`），但是在通过 `python` 导入的时候找不到而已，版本高的 `python` 解释器可能提示`dynamic module does not define module export function (PyInit_example)`
+2. **`Python` 的 `C/C++` 扩展模块机制**：通过 `PyModuleDef`、`PyMethodDef` 和 `PyInit_<模块名>` 三要素，将 `C/C++` 代码封装为 `Python` 模块。
+3. **pytorch 扩展** :`pytorch`中的 [torch-utils-cpp-extension](https://pytorch.ac.cn/docs/stable/cpp_extension.html) 的 [load()](https://pytorch.ac.cn/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load)  函数(这种方式被称为`just in time`)可以即时编译并加载cpp的扩展，其会调用 `Ninja` 构建文件，并在一个临时目录中构建并编译生成`.so`
 
 关于 `pybind11` 的参考资料直接看官方文档：
 
@@ -339,7 +340,7 @@ static PyObject* hello_world(PyObject* self, PyObject* args) {
 // 方法表：定义模块的 Python 函数接口
 static PyMethodDef ExampleMethods[] = {
     {"hello", hello_world, METH_NOARGS, "Print 'hello world' from C."},
-    {nullptr, nullptr, 0, nullptr} // 结束标志
+    {NULL, NULL, 0, NULL} // 结束标志
 };
 
 // 模块的入口函数，Python 解释器加载模块时会调用它
@@ -406,13 +407,13 @@ example_ops.hello()  # 输出: hello world
   - 为任意 `Python` 函数添加训练支持(`torch.library.register_autograd`)
 - `C++/CUDA` 编写自定义操作符,并注册为 `PyTorch` 运算符（也可以将其独立编成一个`wheel`,使用 `pybind11` 对外暴露）
   - 编译：使用 [torch.utils.cpp_extension](https://docs.pytorch.org/docs/stable/cpp_extension.html#torch-utils-cpp-extension) 编译自定义 `C++/CUDA` 代码以供 `PyTorch` 使用。
-  - 定义自定义运算符：通过宏定义（`Macros`）[TORCH_LIBRARY](https://docs.pytorch.org/cppdocs/library.html#library_8h_1a0bd5fb09d25dfb58e750d712fc5afb84)进行注册（一个命名空间只能注册一个 `TORCH_LIBRARY`）。如下所示，该运算符可以通过 `Python` 访问，路径为 `torch.ops.myops.mymuladd`
+  - 定义自定义运算符：通过宏定义（`Macros`）[TORCH_LIBRARY](https://docs.pytorch.org/cppdocs/library.html#library_8h_1a0bd5fb09d25dfb58e750d712fc5afb84)进行注册（一个命名空间只能注册一个 `TORCH_LIBRARY`）,注册规范可参考[Schema reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func)。如下所示，该运算符可以通过 `Python` 访问，路径为 `torch.ops.myops.mymuladd`
     ```c++
     // myops 是 命名空间，m 是 torch::Library 类型。
     TORCH_LIBRARY(myops, m) {
         // Note that "float" in the schema corresponds to the C++ double type
         // and the Python float type.
-        m.def("mymuladd(Tensor a, Tensor b, float c) -> Tensor");
+        m.def("mymuladd(Tensor a, Tensor b, float c) -> Tensor"); 
     }
     ```
   - 注册后端实现：通过宏定义（`Macros`）[TORCH_LIBRARY_IMPL](https://docs.pytorch.org/cppdocs/library.html#library_8h_1a800b28569c0f7d0d9732bf8b6342d9f3)进行注册。为不同的后端（`CPU`、`CUDA`等等）绑定具体的执行函数。（一个命名空间可以注册多个 `TORCH_LIBRARY_IMPL`）
@@ -541,6 +542,65 @@ hello,world!!!
 
 todo... 
 
+## sgl-kernel
+
+> [sgl-kernel README.md](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/README.md)文件
+
+
+首先，如果需要自己编译安装 `sgl-kernel` ，可使用命令：
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+# pip install -e "python[all]"
+cd sgl-kernel && make build -j8
+pip install dist/sgl_xxx.whl --force-install
+```
+
+### 如何调用 cuda kernel ？
+
+主要关注 `csrc` 目录下内容和 `*.cc`文件。
+- `csrc`目录下主要包含对应的 `cuda kernel` 的逻辑。
+- `*.cc`: `*.cc` 文件是 `PyTorch` 扩展模块的核心，其主要功能是 **注册自定义 CUDA 内核函数**。主要是 **声明CUDA函数的接口** 和 **将函数注册到 PyTorch中**。
+- `python/sgl_kernel/__init__.py`文件：主要预处理了一些逻辑，对编译的 `.so`文件进行了二次封装。
+
+首先关注下 `common_extension.cc` 内容，内容进行缩减下：
+```c++
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <torch/all.h>
+#include <torch/library.h>
+
+#include "sgl_kernel_ops.h" //头文件声明导入
+
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+    // 注册函数接口
+    m.def(
+      "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
+      "new_kv) -> ()");
+    
+    // 绑定具体实现，体现为给 GPU 设备(torch::kCUDA), 绑定执行函数为 &lightning_attention_decode
+    m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
+    
+    //...
+}
+
+// 调用宏定义函数，用于设置模块的入口函数，Python 解释器加载模块时会调用它
+REGISTER_EXTENSION(common_ops)
+```
+
+其中上述的 `REGISTER_EXTENSION` 宏定义如下：
+```c++
+// 使用的 Python 的 C/C++ 扩展模块机制（C Extension Module）
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
+```
+
+
+
+
 
 # CMake 构建自动化
 
@@ -548,7 +608,7 @@ todo...
 
 # vscode 调试
 
-代码调试主要是 `python` 代码调试 加 `c++` 代码调试(`cuda-gdb`)。然后基于 `vscode` 将上述过程脚本化（通过配置 `.vscode` 目录下的 `launch.json` 和 `tasks.json` 实现）
+代码调试主要是 `python` 代码调试 加 `cuda` 代码调试(`cuda-gdb`)。然后基于 `vscode` 将上述过程脚本化（通过配置 `.vscode` 目录下的 `launch.json` 和 `tasks.json` 实现）
 
 ## 使用 cuda-gdb
 
