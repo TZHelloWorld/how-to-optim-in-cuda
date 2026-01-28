@@ -318,6 +318,82 @@ void launch_kernel() {
 }
 ```
 
+## `Python` 的 `C/C++` 扩展模块机制（`C Extension Module`）
+
+`Python` 的 `C/C++` 扩展模块机制通过 `PyModuleDef`、`PyMethodDef` 和 `PyInit_<模块名>` 三要素，将 `C/C++` 代码封装为 `Python` 模块。尽管实现复杂，但它提供了**最直接的性能优化路径** 和**底层系统集成能力** ，是构建高性能库的基石。
+
+创建一个 `example_ops.c` 文件，内容为：
+
+```c
+#include <Python.h>
+
+// C 函数实现：打印 "hello world"
+static PyObject* hello_world(PyObject* self, PyObject* args) {
+    // 打印 "hello world" 到 Python 的 stdout
+    printf("hello world\n");
+
+    fflush(stdout);  // 强制刷新标准输出（确保立即显示）
+    Py_RETURN_NONE;  // 返回 Python 的 None
+}
+
+// 方法表：定义模块的 Python 函数接口
+static PyMethodDef ExampleMethods[] = {
+    {"hello", hello_world, METH_NOARGS, "Print 'hello world' from C."},
+    {nullptr, nullptr, 0, nullptr} // 结束标志
+};
+
+// 模块的入口函数，Python 解释器加载模块时会调用它
+PyMODINIT_FUNC PyInit_example_ops() {
+    // 完整模块定义
+    static struct PyModuleDef example_ops_module = {
+        PyModuleDef_HEAD_INIT,          // 固定头部初始化
+        "example_ops",                  // 模块名称（导入时使用的名字）
+        "A simple C extension module that prints 'hello world'.",  // 文档字符串
+        0,                              // 模块的全局状态存储空间大小（0 表示无状态）
+        ExampleMethods                  // 模块的方法表（ nullptr 表示未定义任何函数）
+    };
+
+    return PyModule_Create(&example_ops_module);
+}
+```
+
+使用 `setup.py` 编译为共享库：其中 `setup.py`内容为：
+
+```python
+from setuptools import setup, Extension
+
+module = Extension(
+    'example_ops',                  # 模块名
+    sources=['example_ops.c']      # 源文件
+)
+
+setup(
+    name='example_ops',
+    version='1.0',
+    description='A simple C extension module',
+    ext_modules=[module]
+)
+```
+
+执行命令进行编译,并且在当前目录会生成一个类似 `example_ops.cpython-310-x86_64-linux-gnu.so` 的文件：
+```bash
+>>> python3 setup.py build_ext --inplace
+running build_ext
+building 'example_ops' extension
+creating build/temp.linux-x86_64-cpython-310
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -I/usr/include/python3.10 -c example_ops.c -o build/temp.linux-x86_64-cpython-310/example_ops.o
+creating build/lib.linux-x86_64-cpython-310
+x86_64-linux-gnu-gcc -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 build/temp.linux-x86_64-cpython-310/example_ops.o -L/usr/lib/x86_64-linux-gnu -o build/lib.linux-x86_64-cpython-310/example_ops.cpython-310-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-310/example_ops.cpython-310-x86_64-linux-gnu.so ->
+```
+
+然后在 `python`中执行：
+```python
+import example_ops
+
+example_ops.hello()  # 输出: hello world
+```
+
 
 ## `pytorch` 自定义运算符
 
