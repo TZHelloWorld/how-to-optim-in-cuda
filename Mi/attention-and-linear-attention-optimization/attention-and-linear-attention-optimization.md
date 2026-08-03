@@ -102,7 +102,9 @@ FlashAttention的优化思路是 "算子融合+分块计算"：
 
 假设一组数据 $x=[x_1,x_2,...,x_V]$，其中 $x_i$ 是数组中的第i个元素，则函数 $y=softmax(x)$ 被定义为：
 
-$y_i=\frac{e^{x_i}}{{\textstyle \sum_{j=1}^{V} e^{x_j}}}$
+$$
+y_i=\frac{e^{x_i}}{{\textstyle \sum_{j=1}^{V} e^{x_j}}}
+$$
 
 具体算法如下：
 
