@@ -135,18 +135,18 @@ def rebalance_experts(weight: torch.Tensor, num_replicas: int, num_groups: int,
 def balanced_packing(
     weight: torch.Tensor, num_packs: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    *"""*
-*    将 `n` 个带权重的物品分配到 `m` 个 pack 中，每个 pack 恰好包含 `n/m` 个物品，且所有 pack 的总权重尽可能平衡。*
+    """
+    将 `n` 个带权重的物品分配到 `m` 个 pack 中，每个 pack 恰好包含 `n/m` 个物品，且所有 pack 的总权重尽可能平衡。
 
-*    Parameters:*
-*        weight: [X, n], the weight of each item*
-*        num_packs: number of packs*
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
 
-*    Returns:*
-*        pack_index: [X, n], the pack index of each item*
-*        rank_in_pack: [X, n], the rank of the item in the pack*
-*    """*
-*    *num_layers, num_groups = weight.shape # 模型层数量，每层专家个数
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape # 模型层数量，每层专家个数
     assert num_groups % num_packs == 0
     groups_per_pack = num_groups // num_packs # 每个pack中该分配多少个专家
     
@@ -222,19 +222,19 @@ print(f"rank_in_pack = {rank_in_pack}")
 def replicate_experts(
     weight: torch.Tensor, num_phy: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    *"""*
-*    将 `num_log` 个逻辑专家复制为 `num_phy` 个物理副本，使得所有副本的 最大负载 最小化。*
+    """
+    将 `num_log` 个逻辑专家复制为 `num_phy` 个物理副本，使得所有副本的 最大负载 最小化。
 
-*    Parameters:*
-*        weight: [X, num_log]*
-*        num_phy: total number of experts after replication*
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
 
-*    Returns:*
-*        phy2log: [X, num_phy], logical expert id of each physical expert*
-*        rank: [X, num_phy], the replica rank*
-*        logcnt: [X, num_log], number of replicas for each logical expert*
-*    """*
-*    *n, num_log = weight.shape
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
     num_redundant = num_phy - num_log  # 冗余专家个数
     assert num_redundant >= 0
     device = weight.device 
@@ -345,7 +345,7 @@ logcnt[arangen, redundant_indices] += 1
     [1, 1, 1, 1, 2],  # Layer 1: 专家 4 副本数变为 2
 ]
 
-**# ---------------复制冗余副本 i = 6 -----------------------------**
+# ---------------复制冗余副本 i = 6 -----------------------------
 weight/logcnt = [
     [4/1, 1/1, 12/1, 20/2, 5/1],   # Layer 0: [4, 1, 12, 10, 5]
     [2/1, 3/1, 1/1, 6/1, 20/2]     # Layer 1: [2, 3, 1, 6, 10]
@@ -440,22 +440,22 @@ def rebalance_experts_hierarchical(
     num_nodes: int,
     num_gpus: int,
 ):
-    *"""*
+    """
     在多节点 + 多 GPU 架构中实现专家的层次化负载均衡分配。
     
-*    Parameters:*
-*        weight: [num_moe_layers, num_logical_experts]*
-*        num_physical_experts: number of physical experts after replication*
-*        num_groups: number of expert groups*
-*        num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster*
-*        num_gpus: number of GPUs, must be a multiple of `num_nodes`*
+    Parameters:
+        weight: [num_moe_layers, num_logical_experts]
+        num_physical_experts: number of physical experts after replication
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
 
-*    Returns:*
-*        physical_to_logical_map: [num_moe_layers, num_physical_experts]*
-*        logical_to_physical_map: [num_moe_layers, num_logical_experts, X]*
-*        logical_count: [num_moe_layers, num_logical_experts]*
-*    """*
-*    *num_layers, num_logical_experts = weight.shape
+    Returns:
+        physical_to_logical_map: [num_moe_layers, num_physical_experts]
+        logical_to_physical_map: [num_moe_layers, num_logical_experts, X]
+        logical_count: [num_moe_layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
     assert num_logical_experts % num_groups == 0
     group_size = num_logical_experts // num_groups
     assert num_groups % num_nodes == 0
@@ -580,23 +580,23 @@ def rebalance_experts(
     num_gpus: int,
     enable_hierarchical: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    *"""*
-*    Entry point for expert-parallelism load balancer.*
+    """
+    Entry point for expert-parallelism load balancer.
 
-*    Parameters:*
-*        weight: [layers, num_logical_experts], the load statistics for all logical experts*
-*        num_replicas: number of physical experts, must be a multiple of `num_gpus`*
-*        num_groups: number of expert groups*
-*        num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster*
-*        num_gpus: number of GPUs, must be a multiple of `num_nodes`*
+    Parameters:
+        weight: [layers, num_logical_experts], the load statistics for all logical experts
+        num_replicas: number of physical experts, must be a multiple of `num_gpus`
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
 
-*    Returns:*
-*        physical_to_logical_map: [layers, num_replicas], the expert index of each replica*
-*        logical_to_physical_map: [layers, num_logical_experts, X], the replica indices for each expert*
-*        expert_count: [layers, num_logical_experts], number of physical replicas for each logical expert*
-*    """*
+    Returns:
+        physical_to_logical_map: [layers, num_replicas], the expert index of each replica
+        logical_to_physical_map: [layers, num_logical_experts, X], the replica indices for each expert
+        expert_count: [layers, num_logical_experts], number of physical replicas for each logical expert
+    """
 
-*    *num_layers, num_logical_experts = weight.shape
+    num_layers, num_logical_experts = weight.shape
     weight = weight.float().cpu()
     if enable_hierarchical:
         # use hierarchical load-balance policy
@@ -844,8 +844,8 @@ class ExpertLocationMetadata:
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     num_gpus=ep_size,
                     num_physical_experts=num_physical_experts,
-                    # *TODO improve when we have real EP rank*
-    *                *ep_rank=torch.distributed.get_rank() % ep_size,
+                    # TODO improve when we have real EP rank
+                    ep_rank=torch.distributed.get_rank() % ep_size,
                 )
                 if server_args.ep_dispatch_algorithm == "static"
                 else None

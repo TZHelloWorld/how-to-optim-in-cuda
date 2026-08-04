@@ -95,8 +95,8 @@ def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
 ) -> nn.Module:
-    *"""Initialize a model with the given configurations."""*
-*    *model_class, _ = get_model_architecture(model_config)
+    """Initialize a model with the given configurations."""
+    model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
@@ -193,7 +193,7 @@ def forward_decode(
 ) -> LogitsProcessorOutput:
     self.attn_backend.init_forward_metadata(forward_batch)
     # *FIXME: add pp_proxy_tensors arg to all models*
-*    *kwargs = {}
+    kwargs = {}
     if self.support_pp:
         kwargs["pp_proxy_tensors"] = pp_proxy_tensors
     return self.model.forward(
@@ -429,7 +429,7 @@ self.q_proj = ColumnParallelLinear(
 
 ```Python
 class AttentionBackend(ABC):
-    *"""The base class of attention backends"""*
+    """The base class of attention backends"""
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -439,8 +439,8 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        *"""Run a forward for decode."""*
-    *    *raise NotImplementedError()
+        """Run a forward for decode."""
+        raise NotImplementedError()
     
     def forward_extend(
         self,
@@ -451,8 +451,8 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        *"""Run a forward for extend."""*
-    *    *raise NotImplementedError()
+        """Run a forward for extend."""
+        raise NotImplementedError()
 ```
 
 
@@ -477,7 +477,7 @@ sglang适配新backend
 ```Python
 @staticmethod
 def load_weights_and_postprocess(model, weights, target_device):
-   ** ****model.load_weights(weights)** # 核心，调用的其实是model.py文件中的load_weights方法
+    model.load_weights(weights) # 核心，调用的其实是model.py文件中的load_weights方法
     
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
@@ -726,11 +726,11 @@ def get_quant_config(
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
 
-**# 其实在上面的逻辑中就判别出来了，如果权重是量化的，根据HuggingFace 中config.json里面的逻辑进行判断，然后找到对应的类**
-**# 先通过 quant_cls 获取已经支持的类的名称，然后再将对应的参数创建对应的对象**
-**# 核心逻辑可以简化为：**
-**#     - quant_cls = get_quantization_config(model_config.quantization)**
-**#     - return quant_cls.from_config(hf_quant_config)**
+# 其实在上面的逻辑中就判别出来了，如果权重是量化的，根据HuggingFace 中config.json里面的逻辑进行判断，然后找到对应的类
+# 先通过 quant_cls 获取已经支持的类的名称，然后再将对应的参数创建对应的对象
+# 核心逻辑可以简化为：
+#     - quant_cls = get_quantization_config(model_config.quantization)
+#     - return quant_cls.from_config(hf_quant_config)
 
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -842,32 +842,32 @@ def get_quant_config(
 
 ```Python
 class QuantizeMethodBase(ABC):
-    *"""Base class for different quantized methods."""*
+    """Base class for different quantized methods."""
 
-*    *@abstractmethod
+    @abstractmethod
     def create_weights( # 创建权重，通过PyTorch 中的 register_parameter 方法将将自定义的参数显式绑定到模块
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
-        *"""Create weights for a layer.*
+        """Create weights for a layer.
 
-*        The weights will be set as attributes of the layer."""*
-*        *raise NotImplementedError()
+        The weights will be set as attributes of the layer."""
+        raise NotImplementedError()
     
     # 这个apply方法会在 python/sglang/srt/layers/linear.py 中的 forward 中调用，所以这里一般会实现对应的前向计算逻辑
     @abstractmethod
     def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
-        *"""Apply the weights in layer to the input tensor.*
+        """Apply the weights in layer to the input tensor.
 
-*        Expects create_weights to have been called before on the layer."""*
-*        *raise NotImplementedError()
+        Expects create_weights to have been called before on the layer."""
+        raise NotImplementedError()
 
     # 这个会在 python/sglang/srt/model_loader/loader.py 中调用
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        *"""Process the weight after loading.*
+        """Process the weight after loading.
 
-*        This can be used for example, to transpose weights for computation.*
-*        """*
-*        *return
+        This can be used for example, to transpose weights for computation.
+        """
+        return
 ```
 
 在 PyTorch 中，`register_parameter` 的作用是将自定义的参数（如权重 `weight`）显式绑定到模块（`layer`）中，使其具备以下功能：

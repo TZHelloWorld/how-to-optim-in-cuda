@@ -16,22 +16,22 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-*prompt = "Hey, are you conscious? Can you talk to me?"*
+prompt = "Hey, are you conscious? Can you talk to me?"
 
-*inputs = tokenizer(prompt, return_tensors="pt")*
+inputs = tokenizer(prompt, return_tensors="pt")
 
 # 调用的其实是类 GenerationMixin 中的 generate 方法
-*generate_ids = model.generate(inputs.input_ids, max_length=30)*
+generate_ids = model.generate(inputs.input_ids, max_length=30)
 # or use
-*tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]*
+tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
 # ================ look cache ===============
 from transformers import DynamicCache
 
-*past_key_values = DynamicCache(config=model.config)*
+past_key_values = DynamicCache(config=model.config)
 # 执行过程相当于一次 prefill 阶段。
-*outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)*
-*outputs.past_key_values # access cache filled with key/values from generation*
+outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)
+outputs.past_key_values # access cache filled with key/values from generation
 ```
 
 或者先初始化config，然后初始化模型：
@@ -61,20 +61,20 @@ for name, param in model.named_parameters():
 也可以使用pipeline进行测试：（暂时先不考虑，因为这个pipeline算是其中的一个组成部分而已）
 
 ```Python
-*>>> from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer*
+>>> from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer
 
-*>>> # Sentiment analysis pipeline*
-*>>> analyzer = pipeline("sentiment-analysis")*
+>>> # Sentiment analysis pipeline
+>>> analyzer = pipeline("sentiment-analysis")
 
-*>>> # Question answering pipeline, specifying the checkpoint identifier*
-*>>> oracle = pipeline(*
-*...     "question-answering", model="distilbert/distilbert-base-cased-distilled-squad", tokenizer="google-bert/bert-base-cased"*
-*... )*
+>>> # Question answering pipeline, specifying the checkpoint identifier
+>>> oracle = pipeline(
+...     "question-answering", model="distilbert/distilbert-base-cased-distilled-squad", tokenizer="google-bert/bert-base-cased"
+... )
 
-*>>> # Named entity recognition pipeline, passing in a specific model and tokenizer*
-*>>> model = AutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english")*
-*>>> tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-cased")*
-*>>> recognizer = pipeline("ner", model=model, tokenizer=tokenizer)*
+>>> # Named entity recognition pipeline, passing in a specific model and tokenizer
+>>> model = AutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english")
+>>> tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-cased")
+>>> recognizer = pipeline("ner", model=model, tokenizer=tokenizer)
 ```
 
 
@@ -343,18 +343,18 @@ class xxxMLP(nn.Module):
     class HfQuantizer(ABC):
     
         def preprocess_model(self, model: "PreTrainedModel", dtype=None, **kwargs):
-            *"""*
-        *    Setting model attributes and/or converting model before weights loading. At this point*
-        *    the model should be initialized on the meta device so you can freely manipulate the skeleton*
-        *    of the model in order to replace modules in-place. Make sure to override the abstract method `_process_model_before_weight_loading`.*
+            """
+            Setting model attributes and/or converting model before weights loading. At this point
+            the model should be initialized on the meta device so you can freely manipulate the skeleton
+            of the model in order to replace modules in-place. Make sure to override the abstract method `_process_model_before_weight_loading`.
         
-        *    Args:*
-        *        model (`~transformers.PreTrainedModel`):*
-        *            The model to quantize*
-        *        kwargs (`dict`, *optional*):*
-        *            The keyword arguments that are passed along `_process_model_before_weight_loading`.*
-        *    """*
-        *    *model.is_quantized = True
+            Args:
+                model (`~transformers.PreTrainedModel`):
+                    The model to quantize
+                kwargs (`dict`, *optional*):
+                    The keyword arguments that are passed along `_process_model_before_weight_loading`.
+            """
+            model.is_quantized = True
             model.quantization_method = self.quantization_config.quant_method
             if self.pre_quantized:
                 self._convert_model_for_quantization(model)
@@ -445,13 +445,13 @@ class ParallelInterface(GeneralInterface):
 
 ```Python
 class GptOssConfig(PreTrainedConfig):
-    *r"""*
-*    This will yield a configuration to that of the BERT*
-*    [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.*
+    r"""
+    This will yield a configuration to that of the BERT
+    [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.
 
-*    """*
+    """
 
-*    *model_type = "gpt_oss"
+    model_type = "gpt_oss"
     default_theta = 150000.0
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),

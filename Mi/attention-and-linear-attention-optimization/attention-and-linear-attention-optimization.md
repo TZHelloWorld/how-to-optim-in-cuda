@@ -186,7 +186,7 @@ Safe Softmax 算法需要三个循环，并且这三个循环之间存在数据�
 
 ### 1-Pass Self-Attention
 
-从2-Pass Self-Attention 的算法中发现，对于 $o_i$ 的更新 $o_i \ge ts o_{i-1} + \alpha V[i,:]$ 可以找到 $o_i$ 和 $o_{i-1}$ 之间不依赖于全局数据 $m_N$ 的递归关系，具体而言：
+从2-Pass Self-Attention 的算法中发现，对于 $o_i$ 的更新 $o_i \gets o_{i-1} + \alpha V[i,:]$ 可以找到 $o_i$ 和 $o_{i-1}$ 之间不依赖于全局数据 $m_N$ 的递归关系，具体而言：
 
 ![image.png](images/image%2013.png)
 
@@ -327,7 +327,7 @@ q_n \cdot k_1 & q_n \cdot k_2 & \cdots & q_n \cdot k_n
 \end{bmatrix}
 \times
 \begin{bmatrix}
-e^{(1-1)} & & & {\color{red} e^{-\infty}} \\
+e^{(1-1)} & & & e^{-\infty} \\
 e^{-(2-1)} & e^{-(2-2)} & & \\
 \vdots & \vdots & \ddots & \\
 e^{-(n-1)} & e^{-(n-2)} & \cdots & e^{-(n-n)}
@@ -349,15 +349,15 @@ import torch
 import math
 
 def get_mask(n, slope=1):
-    *"""*
+    """
     参考*ALiBi 位置编码*
-    *当 n=5 时候返回 mask * slope，其中mask是矩阵：*
-    *   [[ 0., -inf, -inf, -inf, -inf],*
-    *    [-1.,   0., -inf, -inf, -inf],*
-    *    [-2.,  -1.,   0., -inf, -inf],*
-    *    [-3.,  -2.,  -1.,   0., -inf],*
-    *    [-4.,  -3.,  -2.,  -1.,   0.]]*
-    *"""*
+    当 n=5 时候返回 mask * slope，其中mask是矩阵：
+       [[ 0., -inf, -inf, -inf, -inf],
+        [-1.,   0., -inf, -inf, -inf],
+        [-2.,  -1.,   0., -inf, -inf],
+        [-3.,  -2.,  -1.,   0., -inf],
+        [-4.,  -3.,  -2.,  -1.,   0.]]
+    """
     mask = torch.triu(torch.zeros(n, n).float().fill_(float("-inf")), 1)
     # -n, ..., -2, -1, 0
     for i in range(n):
@@ -380,17 +380,17 @@ def get_full_mask(n, slopes):
     return mask
 
 def _build_slope_tensor(n_attention_heads: int):
-    *"""*
-*    基于指数衰减的多头注意力斜率生成机制，其核心思想是为每个注意力头分配不同的衰减系数（slope），使不同头能关注不同距离的历史位置。*
-*    这里的衰减系数是 1/2 具体计算方式如下：*
-*    当n_attention_heads=10时候，返回的斜率为：*
-*    tensor([2^(-1), 2^(-2), 2^(-3), 2^(-4), 2^(-5), 2^(-6), 2^(-7), 2^(-8)   ,   2^(-0.5), 2^(-1.5)])*
+    """
+    基于指数衰减的多头注意力斜率生成机制，其核心思想是为每个注意力头分配不同的衰减系数（slope），使不同头能关注不同距离的历史位置。
+    这里的衰减系数是 1/2 具体计算方式如下：
+    当n_attention_heads=10时候，返回的斜率为：
+    tensor([2^(-1), 2^(-2), 2^(-3), 2^(-4), 2^(-5), 2^(-6), 2^(-7), 2^(-8)   ,   2^(-0.5), 2^(-1.5)])
 
-*    ****:param**** n_attention_heads: 注意力头的数量*
-*    ****:return****: *
-*    """*
-*    *
-*    *def get_slopes(n):
+    :param n_attention_heads: 注意力头的数量
+    :return:
+    """
+
+    def get_slopes(n):
         def get_slopes_power_of_2(n):
             start = 2 ** (-(2 ** -(math.log2(n) - 3)))
             ratio = start

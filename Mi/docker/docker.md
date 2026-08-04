@@ -64,19 +64,19 @@ services:
     volumes:
       - /home/work/:/home/work/
       - /home/work/tz/:/workspace
-      *# If you use modelscope, you need mount this directory*
-*      # - ${HOME}/.cache/modelscope:/root/.cache/modelscope*
-*    *restart: always
-    network_mode: host *# required by RDMA*
-*    *privileged: true *# required by RDMA*
-*    # Or you can only publish port 30000*
-*    # ports:*
-*    #   - 30000:30000*
-*    *environment:
+      # If you use modelscope, you need mount this directory
+      # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
+    restart: always
+    network_mode: host # required by RDMA
+    privileged: true # required by RDMA
+    # Or you can only publish port 30000
+    # ports:
+    #   - 30000:30000
+    environment:
       HF_TOKEN: <secret>
-      *# if you use modelscope to download model, you need set this environment*
-*      # - SGLANG_USE_MODELSCOPE: true*
-*    *entrypoint: /bin/bash
+      # if you use modelscope to download model, you need set this environment
+      # - SGLANG_USE_MODELSCOPE: true
+    entrypoint: /bin/bash
     ulimits:
       memlock: -1
       stack: 67108864

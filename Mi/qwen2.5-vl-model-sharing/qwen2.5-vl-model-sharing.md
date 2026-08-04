@@ -120,7 +120,7 @@ messages = [
     }
 ]
 
-*# 输入文本被处理成对话模板的样式，其中图片和视频以占位符的形式占用*
+# 输入文本被处理成对话模板的样式，其中图片和视频以占位符的形式占用
 text = processor.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
 )
@@ -562,7 +562,7 @@ cuda graph就是为了减少Launch开销：
 
 ```Python
 class CudaGraphRunner:
-    *"""A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""*
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
     def __init__(self, model_runner: ModelRunner) # **初始化配置与缓冲区**
     
     # **上下文管理器控制模型捕获模式:在 CUDA Graph 捕获时启用模型的捕获模式（capture_mode=True），捕获结束后恢复原始状态。**

@@ -290,8 +290,8 @@ Megatron-LM代码中的结构主要以GPT-3为主，这个如果要自定义扩�
 
     ```Bash
     def print_rank_0(message):
-        *"""If distributed is initialized, print only on rank 0."""*
-    *    *if torch.distributed.is_initialized():
+        """If distributed is initialized, print only on rank 0."""
+        if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 print(message, flush=True)
         else:
