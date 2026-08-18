@@ -33,6 +33,7 @@
 - [3.10 GPU 设备信息查询](#310-gpu-设备信息查询)
 - [3.11 本章小结](#311-本章小结)
 - [3.12 动手练习](#312-动手练习)
+- [3.13 参考资料](#313-参考资料)
 
 ---
 
@@ -226,16 +227,43 @@ cudaError_t cudaMemcpy(void *dst, const void *src,
 // kind: cudaMemcpyHostToDevice / DeviceToHost / DeviceToDevice / HostToHost
 cudaError_t cudaMemset(void *devPtr, int value, size_t count);
 cudaError_t cudaFree(void *devPtr);                          // 释放设备内存
+```
+
+逐个把参数讲清楚：
+
+- **`cudaMalloc(void **devPtr, size_t size)`**：在设备全局内存上分配 `size` 字节的**线性内存**，并把首地址写入 `*devPtr`。返回的地址保证至少 **256 字节对齐**，天然满足各种向量化访存（如 `float4`）的对齐要求；
+- **`cudaMemcpy(dst, src, count, kind)`**：从 `src` 向 `dst` 拷贝 `count` 字节，`kind` 指明方向（下一小节展开）。注意参数顺序与 C 标准库 `memcpy` 一致——**目的在前、源在后**，写反了方向参数和指针就全乱了；
+- **`cudaMemset(devPtr, value, count)`**：把设备内存的每个**字节**设置为 `value`，常用于结果缓冲区清零；
+- **`cudaFree(devPtr)`**：释放 `cudaMalloc`（或 `cudaMallocManaged` 等）分配的内存。对同一指针 `cudaFree` 两次会返回错误；传入 `nullptr` 则是合法的空操作。
+
+二维/三维数据还有一组带对齐的变体：
+
+```c++
 cudaError_t cudaMallocPitch(void **devPtr, size_t *pitch,
                             size_t width, size_t height);    // 2D 数组，自动行对齐
+cudaError_t cudaMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
+                         size_t width, size_t height, cudaMemcpyKind kind);
+cudaError_t cudaMalloc3D(cudaPitchedPtr *pitchedDevPtr, cudaExtent extent);
+```
+
+`cudaMallocPitch` 会把每一行的起始地址**填充（padding）对齐**到硬件友好的边界，实际行宽（字节）通过 `pitch` 返回——访问第 `r` 行第 `c` 列元素时要用 `(float*)((char*)devPtr + r * pitch) + c`，而不能假设行与行紧密相连。官方推荐 2D/3D 数组用这组 API 分配，以保证按行访问时满足合并访存的对齐条件（第 5 章）。
+
+此外还有一个"摸底"工具，写自适应程序（如根据剩余显存决定分块大小）时很有用：
+
+```c++
+size_t freeBytes, totalBytes;
+cudaMemGetInfo(&freeBytes, &totalBytes);   // 查询当前设备的空闲/总显存（字节）
 ```
 
 几个容易踩坑的细节：
 
 - `cudaMalloc` 接收的是**二级指针**（`void **`）——因为它要修改你的指针本身（把分配到的设备地址写进去），所以调用时要取地址：`cudaMalloc(&dA, bytes)`；
 - `cudaMalloc` 返回的指针指向**设备内存**，主机代码不能直接解引用它，只能把它传给内核或 `cudaMemcpy` 等 API 使用；
-- `cudaMemset` 与 C 标准库的 `memset` 一样按**字节**填充——用它把浮点数组清零没问题，但想填成 `1.0f` 是办不到的；
+- `cudaMemset` 与 C 标准库的 `memset` 一样按**字节**填充——用它把浮点数组清零没问题，但想填成 `1.0f` 是办不到的（`1.0f` 的四个字节各不相同）；
 - 注意所有 API 都返回 `cudaError_t` 错误码——这为 3.8 节的错误检查埋下伏笔。
+
+> [!NOTE]
+> CUDA 11.2 起还提供了**流有序内存分配器**（Stream-Ordered Memory Allocator）：`cudaMallocAsync` / `cudaFreeAsync`。它们把分配/释放作为流中的操作异步执行，并带有内存池复用机制，适合"频繁分配释放临时缓冲区"的场景（详见官方 [Stream Ordered Memory Allocator](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#stream-ordered-memory-allocator) 一节）。初学阶段用同步版三件套即可。
 
 ### 3.6.2 cudaMemcpy 的方向与同步语义
 
@@ -277,6 +305,27 @@ cudaFreeHost(h_data);
 - 优点：**传输带宽更高**（通常提升 2 倍左右）；且是异步拷贝 `cudaMemcpyAsync`（第 6 章）的前提；
 - 缺点：占用不可换出的物理内存，分配过多会拖慢整个系统——**只对频繁参与传输的缓冲区使用**。
 
+锁页内存家族还有两个进阶成员，混个脸熟即可：
+
+```c++
+// 带标志的分配版本（cudaMallocHost 等价于 flags = cudaHostAllocDefault）
+cudaError_t cudaHostAlloc(void **pHost, size_t size, unsigned int flags);
+// 把 malloc/new 已分配好的普通内存"就地注册"为锁页内存（不搬数据）
+cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags);
+cudaError_t cudaHostUnregister(void *ptr);
+```
+
+`cudaHostAlloc` 的常用标志（可按位或组合）：
+
+| 标志 | 含义 | 典型场景 |
+|------|------|---------|
+| `cudaHostAllocDefault` | 普通锁页内存 | 等价于 `cudaMallocHost` |
+| `cudaHostAllocPortable` | 对**所有** CUDA 上下文均为锁页 | 多 GPU 程序 |
+| `cudaHostAllocMapped` | 映射进设备地址空间，内核可直接访问（零拷贝内存），设备侧指针用 `cudaHostGetDevicePointer` 获取 | 集成显卡、数据只被 GPU 读写一次的场景 |
+| `cudaHostAllocWriteCombined` | 写合并内存：CPU 写入更快、跨 PCIe 传输效率更高，但 **CPU 读取极慢** | 只由 CPU 写入、GPU 读取的单向缓冲区 |
+
+`cudaHostRegister` 则适合"缓冲区不是我分配的"的场景——比如第三方库交给你一块 `malloc` 内存，注册后同样能享受高带宽传输与异步拷贝，用完记得 `cudaHostUnregister`。
+
 ### 3.6.4 统一内存（Unified Memory）
 
 前面的方式都要求你亲自管理两个世界的内存、来回 `cudaMemcpy`。统一内存提供了另一种思路——"一个指针、CPU/GPU 都能访问"的编程便利，由驱动按需自动迁移数据：
@@ -298,8 +347,36 @@ cudaFree(data);
 > [!IMPORTANT]
 > 注意示例中内核启动后的 `cudaDeviceSynchronize()`：内核是异步的，在确认 GPU 用完这块内存之前，CPU 不应去访问它——统一内存把拷贝省了，**同步一步都不能省**。
 
+统一内存的"自动配送"也可以人工干预。当你清楚数据接下来会在哪一侧使用时，两个 API 能显著减少按需迁移（缺页）的开销：
+
+```c++
+// 提前把数据搬到指定设备（dstDevice 填 cudaCpuDeviceId 表示搬回主机）
+cudaError_t cudaMemPrefetchAsync(const void *devPtr, size_t count,
+                                 int dstDevice, cudaStream_t stream = 0);
+// 给驱动提供访问模式提示，影响迁移策略
+cudaError_t cudaMemAdvise(const void *devPtr, size_t count,
+                          cudaMemoryAdvise advice, int device);
+// advice 常用值：
+//   cudaMemAdviseSetReadMostly     数据以只读为主，可在多处保留副本
+//   cudaMemAdviseSetPreferredLocation  设定数据的"常驻地"
+//   cudaMemAdviseSetAccessedBy     声明某设备会频繁访问，提前建立映射
+```
+
+典型用法是在内核启动前预取：`cudaMemPrefetchAsync(data, bytes, deviceId)`——相当于把"驱动按需零散配送"变成"提前整车发货"，统一内存的性能常常能因此接近显式拷贝。
+
 > [!TIP]
 > 统一内存非常适合**快速原型开发**和不规则数据结构（链表、树）；但对性能敏感的规整数据，显式 `cudaMalloc` + `cudaMemcpy`（或配合 `cudaMemPrefetchAsync` 预取）通常更快、行为更可控。
+
+### 3.6.5 本节 API 速查
+
+把本节出场的分配方式排在一起对比：
+
+| 分配 API | 内存位置 | 主机可访问 | 设备可访问 | 释放 API | 适用场景 |
+|----------|---------|-----------|-----------|---------|---------|
+| `malloc` / `new` | 主机（可分页） | ✔ | ✘ | `free` / `delete` | 普通主机数据 |
+| `cudaMalloc` | 设备全局内存 | ✘ | ✔ | `cudaFree` | 常规设备缓冲区（性能首选） |
+| `cudaMallocHost` / `cudaHostAlloc` | 主机（锁页） | ✔ | 仅 Mapped 标志时 | `cudaFreeHost` | 频繁参与传输的主机缓冲区 |
+| `cudaMallocManaged` | 统一内存（自动迁移） | ✔ | ✔ | `cudaFree` | 快速原型、不规则数据结构 |
 
 内存的事讲完了。上面已经两次出现 `cudaDeviceSynchronize()` 这个"等一等"的角色，是时候系统盘点 CUDA 的同步原语了。
 
@@ -307,11 +384,30 @@ cudaFree(data);
 
 CUDA 的世界里到处是并行与异步：块内成百上千个线程各跑各的，主机发完指令也不等 GPU。**同步原语的作用就是在需要"对齐进度"的地方画一条线**——1.5.2 节三大抽象中的"栅栏同步"，落到代码上就是这几个 API。它们作用的范围从小到大：
 
-- `__syncwarp()`：warp 级同步（现代架构中 warp 内线程可独立调度，需要时显式同步）；
+- `__syncwarp(mask = 0xffffffff)`：warp 级同步（现代架构中 warp 内线程可独立调度，需要时显式同步，`mask` 指定参与的线程）；
 - `__syncthreads()`：**仅同步单个线程块内的线程**（块级栅栏），并保证块内共享内存/全局内存写入对块内其他线程可见。不同块之间无法用它同步；
 - `cudaDeviceSynchronize()`：主机端阻塞等待设备上所有先前任务完成。
 
-注意前两个是**设备代码里用的**（线程之间互相等），最后一个是**主机代码里用的**（CPU 等 GPU），不要混淆。用"包饺子"类比：`__syncthreads()` 是本桌桌长喊"都停一下，等最慢的人擀完皮再开始包"；`cudaDeviceSynchronize()` 是总经理站在车间门口，等所有桌全部交货才走。
+`__syncthreads()` 还有三个带"投票"功能的变体，同步之余顺便做一次块内统计（第 7 章讲 warp 级原语时会再遇到类似接口）：
+
+```c++
+int __syncthreads_count(int predicate);  // 返回 predicate 非零的线程数
+int __syncthreads_and(int predicate);    // 所有线程 predicate 均非零才返回非零
+int __syncthreads_or(int predicate);     // 任一线程 predicate 非零即返回非零
+```
+
+主机侧的"等待"其实也是一个家族，等待范围从大到小（后两个的主场在第 6 章）：
+
+| API | 等待范围 | 说明 |
+|-----|---------|------|
+| `cudaDeviceSynchronize()` | 整个设备 | 所有流中所有先前任务完成才返回，最重量级 |
+| `cudaStreamSynchronize(stream)` | 单个流 | 只等指定流，不打扰其他流（第 6 章） |
+| `cudaEventSynchronize(event)` | 单个事件 | 只等流中某个"打卡点"，粒度最细（3.9 节） |
+
+注意设备代码里的 `__syncwarp`/`__syncthreads` 是**线程之间互相等**，主机侧三个 API 是 **CPU 等 GPU**，不要混淆。用"包饺子"类比：`__syncthreads()` 是本桌桌长喊"都停一下，等最慢的人擀完皮再开始包"；`cudaDeviceSynchronize()` 是总经理站在车间门口，等所有桌全部交货才走。
+
+> [!NOTE]
+> 还有一族容易与栅栏混淆的**内存栅栏（memory fence）**函数：`__threadfence_block()` / `__threadfence()` / `__threadfence_system()`。区别在于：栅栏同步（`__syncthreads`）是"**等人**"——大家都到齐才继续；内存栅栏是"**等数据**"——只保证自己之前的写入按顺序对指定范围（块内/设备内/全系统）可见，**并不等待其他线程**。日常开发中 `__syncthreads()` 已自带块内可见性保证，内存栅栏主要用于无锁算法、块间通过全局内存传递数据等高级场景（第 7 章原子操作时会再遇到）。
 
 为什么没有"全网格同步"？回忆 1.5.4 节：**块间独立是 CUDA 可扩展性的根基**——块可能先后被调度、根本不同时存在，自然无法互相等待。如果确实需要"所有块都算完再进行下一步"，标准做法是把工作拆成两个内核，内核启动的先后顺序天然构成全局同步点。
 
@@ -369,13 +465,264 @@ CHECK(cudaDeviceSynchronize());   // 捕获内核执行期错误
 > 与 `cudaGetLastError()` 相对的还有 `cudaPeekAtLastError()`：两者都返回最近一次的错误，区别是**前者会把错误状态重置回 `cudaSuccess`（取走回执），后者只看不取（错误状态保留）**。日常用前者即可；只想探查、不想清除状态时用后者。
 
 > [!TIP]
-> 调试越界访问的利器是 `compute-sanitizer`（老版本叫 `cuda-memcheck`）：
->
-> ```bash
-> compute-sanitizer ./app     # 精确定位非法内存访问的内核与代码行
-> ```
->
-> 生产代码中每个同步的 `cudaDeviceSynchronize()` 都有性能代价，不必在每次启动后都加；但**调试阶段**大方地加，配合 `compute-sanitizer`，能把"甩锅"的异步错误钉死在案发现场。
+> 生产代码中每个同步的 `cudaDeviceSynchronize()` 都有性能代价，不必在每次启动后都加；但**调试阶段**大方地加，配合下一小节的 `compute-sanitizer`，能把"甩锅"的异步错误钉死在案发现场。
+
+### 3.8.3 排错利器 compute-sanitizer：从"灵异报错"到精确定位
+
+`CHECK` 宏能告诉你"**出事了**"，但对越界访问这类异步错误，它最多告诉你"在某个同步点收到了 `an illegal memory access was encountered`"——**是哪个内核、哪一行代码、哪个线程、访问了哪个地址**，一概不知。补上这块短板的官方工具就是 **Compute Sanitizer**。
+
+#### 它是什么
+
+`compute-sanitizer` 是 CUDA Toolkit 自带的**功能正确性检查工具集**（位于 `$CUDA_HOME/bin/`，装好 Toolkit 即可用），前身是老工具 `cuda-memcheck`（CUDA 12 起已移除，被 compute-sanitizer 完全取代）。它的工作方式类似 CPU 世界的 Valgrind/AddressSanitizer：**以你的程序为参数启动它**，它在运行时对每一次设备内存访问、每一次同步调用做插桩检查，出错时精确报告到内核名、线程坐标甚至源码行号——不需要修改一行代码。
+
+它其实是四个工具的集合，用 `--tool` 参数切换：
+
+| 工具 | 选项 | 检查内容 | 典型症状 |
+|------|------|---------|---------|
+| **memcheck**（默认） | `--tool memcheck` | 越界/未对齐的内存访问、CUDA API 错误、硬件异常、内存泄漏（配 `--leak-check full`） | 结果错乱、`illegal memory access`、程序偶发崩溃 |
+| **racecheck** | `--tool racecheck` | **共享内存**上的数据竞争（如漏写 `__syncthreads()`） | 结果不稳定、每次跑不一样 |
+| **initcheck** | `--tool initcheck` | 读取**未初始化**的设备全局内存 | 结果里混入垃圾值 |
+| **synccheck** | `--tool synccheck` | 同步原语的非法使用（如 3.7 节警告过的"分支里的 `__syncthreads()`"） | 死锁、结果未定义 |
+
+常用命令行选项：
+
+```bash
+compute-sanitizer [options] ./app [app的参数]
+
+# 常用 options：
+#   --tool <name>          选择工具（默认 memcheck）
+#   --leak-check full      memcheck 附带检查设备内存泄漏（有 cudaMalloc 没 cudaFree）
+#   --log-file out.log     报告写入文件（%p 可展开为进程号）
+#   --error-exitcode 1     检出错误时以非零码退出，方便接入 CI 脚本
+#   --kernel-name kns=<子串>  只检查名字含指定子串的内核（大程序提速用），
+#                          键值对语法，key 还可用 kne=<完整修饰名>、regex=<正则>
+#   --launch-skip N        跳过前 N 次内核启动
+#   --print-limit N        每类错误最多打印 N 条（默认 100，0 表示不限）
+#   --padding N            在每个 CUDA 分配之后加 N 字节"隔离带"——相邻分配
+#                          背靠背时越界会踩进邻居而漏报，加隔离带可抓出来
+```
+
+> [!NOTE]
+> 想让报告显示**源码文件名与行号**，编译时要加 `-lineinfo`（保留行号信息，几乎不影响性能，可与 `-O3` 共存）或 `-G`（完整设备端调试信息，会关闭优化）。调试排错阶段建议养成 `nvcc -O3 -lineinfo` 的习惯。
+
+#### 实战：一次完整的越界排查
+
+下面用一个"每一行看起来都很合理"的错误程序，把排查过程完整走一遍。完整代码见 [`code/sanitizer_oob.cu`](code/sanitizer_oob.cu)，核心部分如下：
+
+```c++
+// 数组逆序：out[i] = in[n - 1 - i]，但埋了一个经典 bug
+__global__ void reverseArray(const float *in, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i <= n) {                       // BUG：应为 i < n，差一错误（off-by-one）
+        out[i] = in[n - 1 - i];         // i == n 时：写 out[n] 越界，读 in[-1] 越界
+    }
+}
+
+int main(void) {
+    const int n = 1000;                 // 故意取一个除不尽 256 的规模
+    const size_t bytes = n * sizeof(float);
+    ...
+    CHECK(cudaMalloc(&dIn, bytes));
+    CHECK(cudaMalloc(&dOut, bytes));
+    CHECK(cudaMemcpy(dIn, hIn, bytes, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;   // ceil(1000/256) = 4 块，共 1024 线程
+    reverseArray<<<blocks, threads>>>(dIn, dOut, n);
+    CHECK(cudaGetLastError());          // 启动配置合法，这里查不出任何问题
+    CHECK(cudaDeviceSynchronize());
+
+    CHECK(cudaMemcpy(hOut, dOut, bytes, cudaMemcpyDeviceToHost));
+    ...
+}
+```
+
+启动了 1024 个线程处理 1000 个元素——本该由 `if (i < n)` 拦下多余的 24 个线程，但 `<=` 放走了其中一个：线程 `i == 1000` 会写 `out[1000]`（合法下标只有 0~999）、读 `in[-1]`。
+
+**第一步：正常运行，观察"症状"。**
+
+```bash
+$ nvcc -O3 -lineinfo sanitizer_oob.cu -o sanitizer_oob
+$ ./sanitizer_oob
+Verify: PASS (1000 elements checked)
+```
+
+程序居然 **跑通了，校验还全对** ！这正是越界写最阴险的地方：`out[n]` 恰好落在 `cudaMalloc` 分配粒度的填充区里，这次没砸到任何人。但它是一颗地雷——换个分配顺序、换张卡、数据规模一变，它可能写坏隔壁缓冲区，让一个毫不相干的内核输出错误结果，或触发 `illegal memory access` 让整个上下文报废。**"能跑通"不等于"没问题"。**
+
+**第二步：交给 compute-sanitizer 复跑。**
+
+```bash
+$ compute-sanitizer ./sanitizer_oob
+```
+
+典型输出（不同环境地址与偏移会不同）：
+
+```text
+========= COMPUTE-SANITIZER
+========= Invalid __global__ write of size 4 bytes
+=========     at reverseArray(const float *, float *, int)+0x70 in sanitizer_oob.cu:25
+=========     by thread (232,0,0) in block (3,0,0)
+=========     Address 0x7f5c92600fa0 is out of bounds
+=========     and is 0 bytes after the nearest allocation at 0x7f5c92600000 of size 4000 bytes
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: main [0x8a2e] in sanitizer_oob
+=========
+========= Invalid __global__ read of size 4 bytes
+=========     at reverseArray(const float *, float *, int)+0x60 in sanitizer_oob.cu:25
+=========     by thread (232,0,0) in block (3,0,0)
+=========     Address 0x7f5c923ffffc is out of bounds
+=========     and is 4 bytes before the nearest allocation at 0x7f5c92400000 of size 4000 bytes
+=========
+========= ERROR SUMMARY: 2 errors
+```
+
+**第三步：读报告。** 这份报告的每一行都是破案线索，逐条解读：
+
+| 报告内容 | 解读 |
+|----------|------|
+| `Invalid __global__ write of size 4 bytes` | 错误类型：对**全局内存**的非法**写**，宽度 4 字节——正好是一个 `float`，对应 `out[i] = ...` |
+| `at reverseArray(...)+0x70 in sanitizer_oob.cu:25` | 案发内核与**源码行号**（编译时加了 `-lineinfo` 才有）：第 25 行，就是 `out[i] = in[n - 1 - i]` |
+| `by thread (232,0,0) in block (3,0,0)` | 肇事线程坐标：块 3 的 232 号线程。反算全局索引 `i = 3 × 256 + 232 = 1000 = n`——**恰好越界 1 个元素**，差一错误的铁证 |
+| `0 bytes after the nearest allocation ... of size 4000 bytes` | 非法地址紧贴在一块 4000 字节（= 1000 个 `float`，就是 `dOut`）分配的**末尾之后 0 字节**——"刚好多写了一个"的标准特征 |
+| 第二条 `Invalid __global__ read` ... `4 bytes before` | 同一行还有一次非法**读**：`in[n - 1 - i]` 在 `i == n` 时变成 `in[-1]`，落在 `dIn` 首地址**之前 4 字节** |
+
+三条线索（线程 `i == n`、写越界"尾后 0 字节"、读越界"头前 4 字节"）交叉印证，指向同一个结论：**边界条件把 `<` 写成了 `<=`**。
+
+**第四步：修复并复验。** 把第 24 行改回 `if (i < n)`，重新编译后再跑一遍：
+
+```bash
+$ compute-sanitizer --leak-check full ./sanitizer_oob
+========= COMPUTE-SANITIZER
+Verify: PASS (1000 elements checked)
+========= ERROR SUMMARY: 0 errors
+```
+
+`ERROR SUMMARY: 0 errors` 才是真正的通过。这里顺手加了 `--leak-check full`——如果程序里有 `cudaMalloc` 忘了配对 `cudaFree`，它会在这一步一并报出 `Leaked 4,000 bytes at 0x...`。
+
+#### 在 PyTorch 自定义算子中使用
+
+真实工程里，你的 CUDA 内核往往不是独立程序，而是编译成 PyTorch 扩展、由 Python 调用的自定义算子。compute-sanitizer **同样适用**——它拦截的是**进程内的所有 CUDA 活动**，不关心宿主程序是 C++ 还是 Python 解释器，直接把 `python` 当作被检查的程序即可：
+
+```bash
+compute-sanitizer python test_my_op.py
+```
+
+但 PyTorch 场景有三个特有的坑，直接照搬前面的流程很可能"查不出、慢到跑不完、报告没行号"。逐个拆解。
+
+**坑一：缓存分配器会"掩护"越界（假阴性）。**
+
+PyTorch 并不是每创建一个 tensor 就调一次 `cudaMalloc`——它的 **缓存分配器（caching allocator）** 会先向 CUDA 申请一大块显存池，再从池里切小块分给各个 tensor：
+
+```text
+compute-sanitizer 看到的：  [============ 一块 512 MB 的合法 cudaMalloc ============]
+PyTorch 实际的切分：        [tensor A][tensor B][tensor C][........空闲........]
+```
+
+你的算子越界写穿了 tensor A、踩进了隔壁的 tensor B——但在 memcheck 眼里，这次访问**仍落在那块 512 MB 的合法分配之内**，一个错误都不会报。这是比前面实战里"分配粒度填充区"更彻底的假阴性：数据实实在在被写坏了（训练 loss 变 NaN、结果随机错乱），工具却说没问题。
+
+解决办法是 PyTorch 官方专门为此保留的环境变量——**关掉缓存分配器**，让每个 tensor 都独立 `cudaMalloc`，边界恢复为真实的分配边界：
+
+```bash
+PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer python test_my_op.py
+```
+
+代价是分配退化为逐次 `cudaMalloc`/`cudaFree`，程序明显变慢——**只在调试时使用**。若仍怀疑"越界恰好踩进背靠背的相邻分配"而漏报，可以再加 `--padding 32`：sanitizer 会在每个分配之后垫一段永远非法的隔离带，踩进去必报错。
+
+**坑二：PyTorch 自身的内核太多，插桩太慢。**
+
+sanitizer 会插桩进程里的**每一个**内核——包括 PyTorch 内部的 elementwise、reduction、cuBLAS 调用等，一个训练 step 可能有成百上千次内核启动，整体慢几十倍。两个对策配合使用：
+
+- **写最小复现脚本**：不要在完整训练脚本上跑 sanitizer；单独写十几行的测试脚本——构造小输入 → 调一次你的算子 → `torch.cuda.synchronize()`；
+- **按内核名过滤**：用 `--kernel-name kns=<子串>` 只对你自己的内核做完整检查，跳过 PyTorch 内部内核的大部分开销。注意值是 `key=value` 格式：`kns`（`kernel_substring`）按子串匹配、`kne`（`kernel_name`）按完整名精确匹配、`regex` 按正则搜索——且匹配的都是**名字修饰（mangled）后**的内核名（如 `_Z14reverse_kernelPKfPfi`），所以用 `kns` 写个独特的子串最省事；还可以配 `--kernel-name-exclude` 反向排除。
+
+**坑三：报告没有源码行号。**
+
+和纯 C++ 一样，编译扩展时要给 `nvcc` 传 `-lineinfo`。两种常见构建方式的写法：
+
+```python
+# 方式一：setup.py（CUDAExtension）
+CUDAExtension(
+    name="my_op", sources=["my_op.cu", ...],
+    extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
+)
+
+# 方式二：JIT 编译（load / load_inline）
+mod = load_inline(..., extra_cuda_cflags=["-O3", "-lineinfo"])
+```
+
+三个坑都填上，来看一个完整的最小复现脚本 [`code/sanitizer_torch_op.py`](code/sanitizer_torch_op.py)——它用 `load_inline` JIT 编译了一个埋着同款 off-by-one bug 的"数组逆序"算子：
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_src = r"""
+__global__ void reverse_kernel(const float *in, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i <= n)                          // BUG：应为 i < n
+        out[i] = in[n - 1 - i];
+}
+
+torch::Tensor reverse_op(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int n = x.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    reverse_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+"""
+
+mod = load_inline(name="my_op",
+                  cpp_sources="torch::Tensor reverse_op(torch::Tensor x);",
+                  cuda_sources=cuda_src, functions=["reverse_op"],
+                  extra_cuda_cflags=["-O3", "-lineinfo"])   # 行号信息
+
+x = torch.arange(1000, dtype=torch.float32, device="cuda")  # 1000 除不尽 256
+y = mod.reverse_op(x)
+torch.cuda.synchronize()
+print("correct:", torch.equal(y, x.flip(0)))
+```
+
+排查命令与典型输出：
+
+```bash
+$ PYTORCH_NO_CUDA_MEMORY_CACHING=1 \
+  compute-sanitizer --kernel-name kns=reverse_kernel --error-exitcode 1 \
+      python sanitizer_torch_op.py
+
+========= COMPUTE-SANITIZER
+========= Invalid __global__ write of size 4 bytes
+=========     at reverse_kernel(const float *, float *, int)+0x70 in cuda.cu:8
+=========     by thread (232,0,0) in block (3,0,0)
+=========     Address 0x7f... is out of bounds
+=========     and is 0 bytes after the nearest allocation at 0x7f... of size 4000 bytes
+...
+========= ERROR SUMMARY: 2 errors
+```
+
+读报告的方法和前面完全一样：内核名、线程坐标（`3 × 256 + 232 = 1000 = n`）、"尾后 0 字节"——铁证依旧。唯一的差别是文件名：JIT 编译时你的 CUDA 源码被写进了缓存目录（`~/.cache/torch_extensions/<name>/cuda.cu`）里的生成文件，报告中的行号指向该文件（`load_inline` 会在你的源码前拼接若干 `#include`，行号相对你的字符串会整体偏移）；用 `setup.py` 编译独立 `.cu` 文件则没有这个问题，行号直指你的源文件。
+
+> [!NOTE]
+> 试着把脚本里的 `1000` 改成 `1024`（能被 256 整除），你会发现即使关了缓存分配器也报不出错——原因与前面实战用例相同：`i == n` 的越界线程根本没被启动，bug 被整除"藏"住了。给自定义算子写测试时，**务必覆盖除不尽块大小的形状**。
+
+PyTorch 场景的排查节奏总结成三步：
+
+1. **先定位是哪个算子**：正常运行加 `CUDA_LAUNCH_BLOCKING=1 python train.py`，强制内核同步启动，让异步错误回到肇事算子对应的 Python 调用栈；
+2. **再写最小复现**：用小 tensor 单独调用该算子（记得测除不尽的形状）；
+3. **最后上 sanitizer 精查**：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `--kernel-name` 过滤 + `-lineinfo` 编译，定位到行。
+
+另外两点提醒：`--leak-check full` 在 PyTorch 下噪声很大（缓存分配器持有的显存退出时不归还，会被误报为泄漏），一般不用；racecheck / initcheck / synccheck 对自定义算子同样有效，用法不变。
+
+#### 使用建议
+
+- **写完任何新内核，第一次跑就挂上 memcheck**——它把"越界了但侥幸没炸"这类未来的地雷当场引爆，成本只是程序变慢（通常数倍到几十倍，调试时完全可接受）；
+- **结果时对时错、和线程数/运行次数有关**，优先怀疑共享内存竞争，跑 `--tool racecheck`；
+- **结果里混入奇怪的垃圾值**，跑 `--tool initcheck`，检查是不是漏了初始化（注意 `cudaMalloc` 分配的内存**内容是未定义的**，并不保证为 0）；
+- **程序卡死不动**，怀疑分支里的 `__syncthreads()`，跑 `--tool synccheck`；
+- 在 CI 中用 `--error-exitcode 1` 让检出错误直接判为测试失败；
+- compute-sanitizer 关注**功能正确性**；性能分析请用 Nsight Systems / Nsight Compute（第 8 章），两类工具各司其职。
 
 程序能跑对了，下一个问题自然是：跑得多快？
 
@@ -390,7 +737,7 @@ CPU 端计时器（`std::chrono` 等）测内核有两个先天缺陷：
 1. **内核启动是异步的**——不加同步的话，你测到的只是"发指令"的时间（微秒级），而不是内核真正的执行时间；必须先 `cudaDeviceSynchronize()` 再停表，而同步本身也有开销，会混进测量结果；
 2. **测量位置隔着一条马路**——CPU 的表掐的是"主机视角"，包含启动开销、驱动调度等噪声。
 
-CUDA Event 的思路不同：**让 GPU 自己打卡**。`cudaEventRecord` 把一个"打卡点"插进 GPU 的任务队列（流）里，GPU 执行到那里时记下自己时间线上的时刻——两个打卡点之间的间隔就是纯粹的 GPU 耗时，与主机端的噪声无关，分辨率约为 0.5 微秒。
+CUDA Event 的思路不同：**让 GPU 自己打卡**。`cudaEventRecord` 把一个"打卡点"插进 GPU 的任务队列（流）里，GPU 执行到那里时记下自己时间线上的时刻——两个打卡点之间的间隔就是 GPU 时间线上的耗时，与主机端的噪声无关，分辨率约为 0.5 微秒。（"与主机端无关"这句话有一个重要的限定条件，3.9.3 节专门算这笔细账。）
 
 ### 3.9.2 Event 计时的基本骨架
 
@@ -414,7 +761,60 @@ cudaEventDestroy(stop);
 
 流程是固定的五步：创建两个事件 → 起点打卡 → 干活 → 终点打卡 → `cudaEventSynchronize` 等终点事件完成后取间隔。注意 `cudaEventElapsedTime` 返回的单位是**毫秒**。
 
-### 3.9.3 完整示例与有效带宽
+把 Event 家族的 API 列全（后两个进阶接口第 6 章还会用到）：
+
+| API | 作用 | 备注 |
+|-----|------|------|
+| `cudaEventCreate(&e)` | 创建事件 | 用完须 `cudaEventDestroy` |
+| `cudaEventCreateWithFlags(&e, flags)` | 带标志创建 | `cudaEventBlockingSync`：等待时让出 CPU（阻塞而非自旋）；`cudaEventDisableTiming`：不记时间戳，专用于第 6 章的跨流依赖，开销更小 |
+| `cudaEventRecord(e, stream)` | 把"打卡点"插入流 | `stream` 省略即默认流 |
+| `cudaEventSynchronize(e)` | 阻塞等待事件完成 | 计时前必须等终点事件 |
+| `cudaEventQuery(e)` | **非阻塞**探询事件是否完成 | 完成返回 `cudaSuccess`，未完成返回 `cudaErrorNotReady`（这不是"出错"，注意别被 CHECK 宏误杀） |
+| `cudaEventElapsedTime(&ms, start, stop)` | 两事件间隔（毫秒） | 两个事件都须已完成，且不能用 `cudaEventDisableTiming` 创建 |
+| `cudaEventDestroy(e)` | 销毁事件 | — |
+
+### 3.9.3 Event 测的究竟是什么：两条时间线的细账
+
+一个常见疑问：`cudaEventRecord` 本身也是 CPU 调用、也要"入队"，内核启动也有开销——这些难道不会影响测量结果吗？答案分两层：**`cudaEventRecord` 的 CPU 开销不会计入，但内核在 GPU 侧的启动延迟会**。把两条时间线画开就清楚了：
+
+```text
+CPU 时间线:  [record(start)入队][launch K 入队][record(stop)入队]   ← 这些 API 调用
+                    │                │               │               各花几微秒，但
+                    ▼                ▼               ▼               不计入测量结果
+GPU 队列:    [start 打卡] ─────→ [内核 K] ─────→ [stop 打卡]
+GPU 时间线:      t0 ──(启动延迟)──→ K 执行完 ──→ t1
+                  └────────── 测到的 = t1 - t0 ──────────┘
+```
+
+`cudaEventRecord` 是**异步**的：它只负责把"记录时间戳"这条命令排进流里就立刻返回，时间戳是 GPU 自己执行到那条命令时才记的。所以三次 CPU 调用各花多少微秒、CPU 有没有卡顿，都不直接进入 `t1 - t0`——这就是"免疫主机端噪声"的含义。
+
+但 `t1 - t0` 也**并非纯粹的内核执行时间**，它是 GPU 时间线上两个打卡点之间的**墙钟时间**，拆开看包含四部分：
+
+| 成分 | 量级 | 说明 |
+|------|------|------|
+| 内核真正的执行时间 | 主体 | 你想测的东西 |
+| GPU 侧的内核启动/调度延迟 | 约 3~10 μs | GPU 从"处理完 start 打卡"到"内核第一个块开跑"之间的命令分发、块调度开销——**躲不掉，会被计入** |
+| 打卡命令本身的执行 | 亚微秒 | 只是写一个时间戳（分辨率 ~0.5 μs 即由此而来），可忽略 |
+| 两个打卡点之间 GPU 的任何**空转** | 视情况，可以很大 | 见下面的坑 |
+
+最后一条是真正的坑：如果两个打卡点之间 GPU 在干等，**等待时间也被如实算进去**。典型反例：
+
+```c++
+cudaEventRecord(start);
+do_some_cpu_work();              // CPU 先忙了 2 ms 才提交内核
+kernel<<<grid, block>>>(...);    // GPU 处理完 start 打卡后一直闲着等命令
+cudaEventRecord(stop);
+// 测出来 ≈ 2 ms + 内核时间——CPU 的拖延以"GPU 空转"的形式混了进来
+```
+
+所以准确的说法是：Event 计时**免疫 CPU 的 API 调用开销，但不免疫"CPU 提交不及时导致的 GPU 空等"**——打卡与发工作必须背靠背写，中间别夹 CPU 逻辑。
+
+这笔细账也解释了下一小节两个测量守则的由来：**预热**剔除首次启动的 JIT/初始化等一次性大头；**循环多次夹在一对 Event 之间取平均**，把每次几微秒的 GPU 侧启动延迟摊薄到可忽略——而且循环内 CPU 只做入队（远快于内核执行），队列始终喂饱，GPU 不会空转。反之，若**单次**测量一个只跑几微秒的小内核，启动延迟与内核时间同量级，结果会显著偏大。
+
+> [!NOTE]
+> 如果需要严格排除启动延迟的"纯内核硬件执行时长"，请用 profiler——Nsight Compute / Nsight Systems 直接从硬件读取内核的起止时间戳（第 8 章）。日常优化迭代用 Event（快、可嵌入代码、结果足够做相对比较），精细分析用 profiler，两者互补。
+
+### 3.9.4 完整示例与有效带宽
 
 实际测量还要讲究两点，见本章示例 [`code/event_timing.cu`](code/event_timing.cu) 的核心片段：
 
@@ -441,7 +841,7 @@ ms /= iters;
 ```
 
 - **预热（warmup）**：首次内核启动包含 JIT、上下文初始化等一次性开销（1.8.3 节），先空跑一次再计时；
-- **多次迭代取平均**：单次测量抖动大，跑 100 次取平均值更稳定。
+- **多次迭代取平均**：单次测量抖动大，跑 100 次取平均值更稳定，同时把每次启动的 GPU 侧调度延迟（3.9.3 节）摊薄到可忽略。
 
 拿到时间之后怎么判断"快不快"？衡量访存型内核时，习惯把时间换算成**有效带宽**并与硬件峰值对比：
 
@@ -454,6 +854,19 @@ $$\text{Effective Bandwidth (GB/s)} = \frac{\text{读取字节数} + \text{写�
 ## 3.10 GPU 设备信息查询
 
 GPU 的很多参数信息对性能有直接影响：SM 数量决定该开多少块、每块共享内存上限决定优化策略、峰值带宽是 3.9 节的对比基准……这些数字每张卡都不同，写程序前先"摸底"。1.4.5 节留过一个伏笔——在代码里查询计算能力的办法，就是本节的 `cudaGetDeviceProperties`。
+
+先把设备管理这组 API 列全：
+
+```c++
+cudaError_t cudaGetDeviceCount(int *count);                       // 有几块 GPU
+cudaError_t cudaGetDeviceProperties(cudaDeviceProp *prop, int dev); // 查属性
+cudaError_t cudaSetDevice(int dev);      // 选定后续操作的目标 GPU（默认 0 号）
+cudaError_t cudaGetDevice(int *dev);     // 查询当前选定的 GPU
+cudaError_t cudaDriverGetVersion(int *v);   // 驱动支持的 CUDA 版本（如 12040 = 12.4）
+cudaError_t cudaRuntimeGetVersion(int *v);  // 链接的 Runtime 版本
+```
+
+单卡程序通常只用前两个；多 GPU 时用 `cudaSetDevice` 切换目标设备——之后的 `cudaMalloc`、内核启动都作用于选定的卡。
 
 ### 3.10.1 示例：枚举并查询所有设备
 
@@ -499,7 +912,7 @@ int main(void) {
 }
 ```
 
-代码里有一处小计算值得说明：峰值带宽那行的 `2.0 * memoryClockRate * (busWidth / 8)`——内存频率 × 总线字节宽度得到每周期传输量，乘 2 是因为 DDR 类显存每个时钟周期传输两次数据。这个数字正是 3.9.3 节有效带宽的对比基准。
+代码里有一处小计算值得说明：峰值带宽那行的 `2.0 * memoryClockRate * (busWidth / 8)`——内存频率 × 总线字节宽度得到每周期传输量，乘 2 是因为 DDR 类显存每个时钟周期传输两次数据。这个数字正是 3.9.4 节有效带宽的对比基准。
 
 ### 3.10.2 值得关注的字段
 
@@ -534,23 +947,41 @@ int main(void) {
 - 执行配置完整形式 `<<<grid, block, sharedMemBytes, stream>>>`；内置变量两坐标（`threadIdx`/`blockIdx`）加两尺寸（`blockDim`/`gridDim`），另有 `warpSize`；
 - 块数**向上取整**（`cuda::ceil_div` 或 `(n + threads - 1) / threads`）与内核内**边界检查**（`if (i < n)`）是标准搭配；
 - 五类变量存储：寄存器（默认局部变量）、`__shared__`、`__device__`、`__constant__`、`__managed__`，牢记作用域与生命周期表——**作用域越大、速度越慢**；
-- 内存管理三件套 `cudaMalloc / cudaMemcpy / cudaFree`；`cudaMemcpy` 有四种方向枚举且是**同步** API，内核启动与 `cudaMemcpyAsync` 是**异步**的；频繁传输用锁页内存（`cudaMallocHost`），快速原型用统一内存（`cudaMallocManaged`）；
-- `__syncthreads()` 只同步块内且必须全员到达；主机端等待整个设备用 `cudaDeviceSynchronize()`；块间无同步原语——需要时拆成两个内核；
-- 错误检查双保险：`cudaGetLastError()`（启动错误，读取并重置）+ 同步点（执行期错误）；`cudaPeekAtLastError()` 只读不重置；越界排查用 `compute-sanitizer`；
-- 内核计时用 **CUDA Event**（GPU 时间线打卡，先预热、多次取平均），并换算成有效带宽与硬件峰值对比；硬件参数用 `cudaGetDeviceProperties` 查询。
+- 内存管理三件套 `cudaMalloc / cudaMemcpy / cudaFree`；`cudaMemcpy` 有四种方向枚举且是**同步** API，内核启动与 `cudaMemcpyAsync` 是**异步**的；频繁传输用锁页内存（`cudaMallocHost` / `cudaHostAlloc`，已有内存可 `cudaHostRegister` 就地注册），快速原型用统一内存（`cudaMallocManaged`，可用 `cudaMemPrefetchAsync` / `cudaMemAdvise` 干预迁移）；
+- `__syncthreads()` 只同步块内且必须全员到达；主机端等待按范围从大到小有 `cudaDeviceSynchronize` / `cudaStreamSynchronize` / `cudaEventSynchronize`；块间无同步原语——需要时拆成两个内核；
+- 错误检查双保险：`cudaGetLastError()`（启动错误，读取并重置）+ 同步点（执行期错误）；`cudaPeekAtLastError()` 只读不重置；
+- **compute-sanitizer** 是功能正确性检查的官方工具集：memcheck（越界/泄漏，默认）、racecheck（共享内存竞争）、initcheck（未初始化读）、synccheck（非法同步）；编译加 `-lineinfo` 可定位到源码行，新内核第一次跑就应挂上 memcheck；排查 PyTorch 自定义算子时直接 `compute-sanitizer python ...`，但要记得 `PYTORCH_NO_CUDA_MEMORY_CACHING=1` 关掉缓存分配器，否则越界会被显存池"掩护"成假阴性；
+- 内核计时用 **CUDA Event**（GPU 时间线打卡，先预热、多次取平均），并换算成有效带宽与硬件峰值对比；注意 Event 免疫 CPU 调用开销，但测的是两打卡点间的 GPU **墙钟时间**——内核启动延迟和打卡点之间的 GPU 空转都会计入；硬件参数用 `cudaGetDeviceProperties` 查询。
 
 工具箱备齐了。下一章我们潜入硬件内部，看这些线程在 SM 上究竟是如何被调度执行的——warp、SIMT、延迟隐藏，第 1 章埋下的伏笔将逐一展开。
 
 ## 3.12 动手练习
 
-> 本章示例代码位于 [`code/`](code/) 目录：`device_query.cu`、`event_timing.cu`。
+> 本章示例代码位于 [`code/`](code/) 目录：`device_query.cu`、`event_timing.cu`、`sanitizer_oob.cu`、`sanitizer_torch_op.py`。
 
 1. 运行 `device_query.cu`，记下你的 GPU 的 SM 数量、每 SM 最大线程数、共享内存大小和峰值带宽——后续章节都会用到这些数字；
-2. 运行 `event_timing.cu`，计算向量加法达到峰值带宽的百分比；再把 `n` 缩小到 `1 << 10`，观察带宽数字为何暴跌（提示：内核太小，启动开销占主导）；
-3. 把 `vec_add` 改为统一内存版本（`cudaMallocManaged`），对比代码简洁度与性能；
-4. 写一段代码触发一个异步错误（内核里越界写），验证错误只在 `cudaDeviceSynchronize()` 处被报出，再用 `compute-sanitizer` 精确定位；
-5. 试着把一个内核的返回类型从 `void` 改成 `float`，或给 `__global__` 函数同时加上 `__host__`，观察 `nvcc` 的报错信息——亲眼见过这些编译错误，以后排查会快得多；
-6. 用 `<<<1, 2048>>>` 启动任意内核（超过 `maxThreadsPerBlock` 上限），验证这是一个**同步错误**：紧跟其后的 `cudaGetLastError()` 就能捕获，不需要等到同步点。
+2. 运行 `event_timing.cu`，计算向量加法达到峰值带宽的百分比；再把 `n` 缩小到 `1 << 10`，观察带宽数字为何暴跌（提示：内核太小，3.9.3 节的启动延迟占了主导）；
+3. 把 `vec_add` 改为统一内存版本（`cudaMallocManaged`），对比代码简洁度与性能；再加上 `cudaMemPrefetchAsync` 预取，看性能能否追回显式拷贝版本；
+4. 编译运行 `sanitizer_oob.cu`（记得加 `-lineinfo`），复现 3.8.3 节的完整排查流程：先正常跑（大概率"侥幸"通过校验），再用 `compute-sanitizer` 定位到肇事线程与源码行，修复后复验至 `ERROR SUMMARY: 0 errors`；
+5. 在 `sanitizer_oob.cu` 里注释掉一个 `cudaFree`，用 `compute-sanitizer --leak-check full` 验证泄漏能被查出；再把 `n` 改成 256 的整数倍（如 `1 << 20`），先预测 `compute-sanitizer` 还能不能查出越界，再运行验证（提示：想想这时启动了多少个线程、`i == n` 的线程还存不存在——bug 没被修好，只是被"藏"起来了）；
+6. （装有 PyTorch 的环境）运行 `sanitizer_torch_op.py`，做一组对照实验：① 直接挂 `compute-sanitizer` 跑；② 加上 `PYTORCH_NO_CUDA_MEMORY_CACHING=1` 再跑。观察缓存分配器如何把越界"掩护"掉，体会为什么排查 PyTorch 算子必须关掉它；
+7. 试着把一个内核的返回类型从 `void` 改成 `float`，或给 `__global__` 函数同时加上 `__host__`，观察 `nvcc` 的报错信息——亲眼见过这些编译错误，以后排查会快得多；
+8. 用 `<<<1, 2048>>>` 启动任意内核（超过 `maxThreadsPerBlock` 上限），验证这是一个**同步错误**：紧跟其后的 `cudaGetLastError()` 就能捕获，不需要等到同步点。
+
+## 3.13 参考资料
+
+| 主题 | 官方文档 |
+|------|---------|
+| CUDA C++ 编程指南（语法、修饰符、内置变量） | https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html |
+| CUDA Runtime API 参考（本章全部 `cuda*` 函数的权威签名） | https://docs.nvidia.com/cuda/cuda-runtime-api/index.html |
+| 内存管理 API（Memory Management） | https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html |
+| 统一内存编程（Unified Memory Programming） | https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd |
+| 错误处理（Error Handling） | https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__ERROR.html |
+| Compute Sanitizer 用户手册 | https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html |
+| PyTorch CUDA 语义（缓存分配器与调试环境变量） | https://pytorch.org/docs/stable/notes/cuda.html |
+| PyTorch 自定义 C++/CUDA 扩展 | https://pytorch.org/tutorials/advanced/cpp_extension.html |
+| Event 管理（Event Management） | https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html |
+| 设备管理与 `cudaDeviceProp` 字段 | https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html |
 
 ---
 

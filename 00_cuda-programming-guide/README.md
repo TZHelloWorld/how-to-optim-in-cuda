@@ -40,7 +40,7 @@
 |------|---------|------|
 | [第 1 章 CUDA 与异构计算入门](01_introduction/README.md) | 并行计算基础、GPU vs CPU、异构计算与 Amdahl 定律、CUDA 平台全貌、可扩展编程模型、环境搭建、nvcc 与 PTX/cubin、Hello World、向量加法 | ⭐ 入门 |
 | [第 2 章 编程模型：线程组织](02_programming_model/README.md) | Grid/Block/Thread 层次、线程索引计算、2D 矩阵示例、grid-stride loop、执行配置选择 | ⭐ 入门 |
-| [第 3 章 基本语法与常用 API](03_syntax_and_api/README.md) | 函数/变量修饰符、内存管理 API、同步、错误检查、事件计时、统一内存、设备查询 | ⭐⭐ 基础 |
+| [第 3 章 基本语法与常用 API](03_syntax_and_api/README.md) | 函数/变量修饰符、内存管理 API、同步、错误检查与 compute-sanitizer、事件计时、统一内存、设备查询 | ⭐⭐ 基础 |
 | [第 4 章 CUDA 执行模型](04_execution_model/README.md) | SM 架构、warp 与 SIMT、延迟隐藏、占用率、线程束分化、并行归约、循环展开 | ⭐⭐⭐ 进阶 |
 | [第 5 章 CUDA 内存模型](05_memory_model/README.md) | 5.1 内存层次总览、锁页与零拷贝、L1/L2；5.2 合并访问法则、访问模式图解、AoS/SoA、矩阵转置、带宽基准 + 进阶：段/事务/缓存行；5.3 Bank 冲突、内存填充、共享内存转置与归约 | ⭐⭐⭐~⭐⭐⭐⭐ 进阶到深入 |
 | [第 6 章 流与并发](06_streams_and_concurrency/README.md) | CUDA 流、异步拷贝、计算与传输重叠、事件同步、多流流水线；深度专题：同步机制/CUDA Graph/LLM 推理案例 | ⭐⭐⭐⭐ 深入 |
