@@ -287,7 +287,7 @@ nvprof --metrics shared_load_transactions_per_request ./app  # 共享内存 bank
 
 1. **经典内核手写练习**：GEMM（矩阵乘）逐级优化（tiling → 双缓冲 → Tensor Core）、softmax、layernorm、scan（前缀和）——这是面试与实战的硬通货；
 2. **官方库源码**：CUB（块级/设备级原语库）、Thrust（并行 STL）、CUTLASS（GEMM 模板库）——读它们的源码，就是在看第 4、5、7 章的知识点被工业级地运用；
-3. **高级特性**：CUDA Graph（降低启动开销）、异步拷贝 `cp.async`（Ampere+）、TMA（Hopper）、动态并行、多 GPU（NCCL）——其中 CUDA Graph 在第 6 章的深度专题中已有入门介绍；
+3. **高级特性**：CUDA Graph（降低启动开销）、异步拷贝 `cp.async`（Ampere+）、TMA（Hopper）、动态并行、多 GPU（NCCL）——其中 CUDA Graph 在第 6 章 6.7 节已有入门介绍；
 4. **PTX/SASS 层面**：`nvcc -ptx` 与 `cuobjdump --dump-sass` 查看编译产物，理解编译器行为（编译流程的基础见第 1 章 1.8 节）；
 5. **持续阅读**：每代新架构的 Tuning Guide、GTC 技术演讲、[CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html) 的更新章节。
 

@@ -24,9 +24,9 @@
 │   ├── README.md                    │    5.1 层次总览 + 5.2 全局内存深入 + 5.3 共享内存深入
 │   └── code/                        │    main.cu（带宽基准）、transpose_smem.cu、reduce_smem.cu
 ├── 06_streams_and_concurrency/      ← 第 6 章：流与并发
-│   ├── README.md                    │    教程正文 + ⭐ 深度专题（专题 1~12）：Stream/同步/
-│   │                                │       CUDA Graph + SGLang LLM 推理真实 trace 案例分析
-│   └── code/                        │    深度专题配套 PyTorch 实验代码与 trace 文件
+│   ├── README.md                    │    异步模型/Stream/同步与事件/多流流水线/隐式同步/
+│   │                                │       CUDA Graph/PyTorch Stream + SGLang LLM 推理 trace 案例
+│   └── code/                        │    配套 PyTorch 实验代码与 trace 文件
 ├── 07_atomics_and_warp/             ← 第 7 章：原子操作与 Warp 级原语
 │   ├── README.md
 │   └── code/                        │    histogram.cu、reduce_final.cu
@@ -43,18 +43,18 @@
 | [第 3 章 基本语法与常用 API](03_syntax_and_api/README.md) | 函数/变量修饰符、内存管理 API、同步、错误检查与 compute-sanitizer、事件计时、统一内存、设备查询 | ⭐⭐ 基础 |
 | [第 4 章 CUDA 执行模型](04_execution_model/README.md) | SM 架构、warp 与 SIMT、延迟隐藏、占用率、线程束分化、并行归约、循环展开 | ⭐⭐⭐ 进阶 |
 | [第 5 章 CUDA 内存模型](05_memory_model/README.md) | 5.1 内存层次总览、锁页与零拷贝、L1/L2；5.2 合并访问法则、访问模式图解、AoS/SoA、矩阵转置、带宽基准 + 进阶：段/事务/缓存行；5.3 Bank 冲突、内存填充、共享内存转置与归约 | ⭐⭐⭐~⭐⭐⭐⭐ 进阶到深入 |
-| [第 6 章 流与并发](06_streams_and_concurrency/README.md) | CUDA 流、异步拷贝、计算与传输重叠、事件同步、多流流水线；深度专题：同步机制/CUDA Graph/LLM 推理案例 | ⭐⭐⭐⭐ 深入 |
+| [第 6 章 流与并发](06_streams_and_concurrency/README.md) | 异步执行模型、流与默认流精确语义、多流流水线、同步与事件、隐式同步排查、CUDA Graph、PyTorch Stream 实现与 LLM 推理 trace 案例 | ⭐⭐⭐⭐ 深入 |
 | [第 7 章 原子操作与 Warp 级原语](07_atomics_and_warp/README.md) | 原子函数、直方图实例、warp shuffle、warp 级归约、协作组简介 | ⭐⭐⭐⭐ 深入 |
 | [第 8 章 性能优化最佳实践](08_best_practices/README.md) | APOD 方法论、四大优化清单、性能分析工具、常见错误与陷阱、综合实战与进阶路线 | ⭐⭐⭐⭐⭐ 精通 |
 
-## ⭐ 深度专题（进阶阅读）
+## ⭐ 实战专题（进阶阅读）
 
-教程正文之外，两个附带**可运行验证代码**的深度专题已整合进对应章节的正文中，适合读完章节基础部分后深入研读：
+教程正文之外，两处附带**可运行验证代码**的实战内容已整合进对应章节的正文中，适合读完章节基础部分后深入研读：
 
 | 专题 | 位置 | 内容 |
 |------|------|------|
 | [配套基准测试：实测验证访问模式的影响](05_memory_model/README.md#526-配套基准测试实测验证访问模式的影响) | 第 5 章 5.2.6 节 | 带宽基准测试程序（代码位于 `05_memory_model/code/main.cu`），用实测数据验证对齐/跨步/合并访问的性能差异 |
-| [深度专题：CUDA Stream 与同步机制（专题 1~12）](06_streams_and_concurrency/README.md#深度专题cuda-stream-与同步机制) | 第 6 章后半部分 | 异步执行模型、三级同步原语、Default Stream 语义、PyTorch Stream 实现、隐式同步陷阱、CUDA Graph，以及 SGLang + Qwen3 真实 profiler trace 的 LLM 推理多流案例分析（PyTorch 实验代码位于 `06_streams_and_concurrency/code/`） |
+| [隐式同步排查 + LLM 推理多流案例](06_streams_and_concurrency/README.md#66-隐式同步看不见的等待) | 第 6 章 6.6~6.9 节 | 隐式同步的官方触发清单与 trace 识别、PyTorch Stream 实现、CUDA Graph，以及 SGLang + Qwen3 真实 profiler trace 的 LLM 推理多流案例分析（PyTorch 实验代码位于 `06_streams_and_concurrency/code/`） |
 
 ## 🗺️ 学习路线建议
 
@@ -73,7 +73,7 @@
   目标：掌握合并访问与 bank 冲突，独立优化矩阵转置/归约到接近带宽上限
 
 第四阶段：高级特性（按需）
-  第 6 章 → 第 7 章 → 第 8 章（+ 第 6 章 Stream 深度专题）
+  第 6 章 → 第 7 章 → 第 8 章（+ 第 6 章 6.6~6.9 隐式同步与 LLM 案例）
   目标：多流重叠、原子操作、warp 原语，形成完整的优化方法论
 ```
 

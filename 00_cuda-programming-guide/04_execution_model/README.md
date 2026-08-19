@@ -284,14 +284,52 @@ if (warp_id % 2 == 0) { ... }   // 以组为单位分工，warp 内部零分化
 
 对比一下你熟悉的 CPU：CPU 切换线程要把寄存器压栈、刷新流水线、换页表——好比工人换岗要先把整个工具台收拾干净搬走，再把下一位的工具台搬进来，成本高昂。而 GPU 的做法是**给每个 warp 一张固定的专属工具台**（4.1 节那块巨大的寄存器文件就是为此准备的，Fermi 之后每 SM 动辄 6 万多个寄存器），换岗时人走台留，随时回来接着干。代价是每张"工具台"都占着寄存器不放——这笔账马上会算到占用率头上。
 
-### 4.4.2 warp 的三种状态：活跃、就绪与阻塞
+### 4.4.2 warp 的状态机：活跃、就绪、选中与阻塞
 
-"调度器转移控制权"这件事可以说得更精确。已经分配到 SM 上、资源（寄存器/共享内存）就位的 warp 称为**活跃的（active）warp**；在每个时钟周期，warp 调度器从活跃 warp 中挑选可以发射指令的对象。按当下能不能开工，活跃 warp 又分两类：
+"调度器转移控制权"这件事可以说得更精确。这套术语的权威出处是官方 Nsight Compute 的硬件模型与调度器统计（Scheduler Statistics）——它不只是理论词汇，更是你日后读 profiler 报告时每天要面对的指标名。
 
-- **就绪的（eligible）warp**：执行所需的资源齐备（下一条指令已就位、操作数已就绪、有空闲的执行单元），随时可被调度器选中发射；
-- **阻塞的（stalled）warp**：还在等待——等内存数据、等前一条指令的结果、等同步点等，暂时无法发射。
+**先看舞台：warp 住在哪。** 现代 SM（Volta 起）被划分为 **4 个处理分区（SM Sub Partition，SMSP）**，每个分区自带一名 warp 调度器、一份寄存器堆和一套执行单元（整数/浮点/LD-ST/SFU/Tensor Core）——正是 4.2.3 节 Fermi"两条流水线"设计的现代版。官方模型里有两条关键规则：
 
-调度器每个周期做的事就是：从就绪队列里挑 warp 发射指令。**延迟隐藏成立的条件，就是任意时刻就绪队列都不空**——只要总有 eligible warp 可发射，个别 warp 阻塞多久都无所谓，计算单元照样满负荷。反过来，若某个周期一个就绪 warp 都找不到，流水线就只能空转，延迟便"藏不住"了。
+1. **一个 warp 从启动到完成固定驻留在一个分区里**（"A warp is allocated to a sub partition and resides on the sub partition from launch to completion"）——和 4.3.4 节"线程与 lane 终生绑定"一个脾气：绑定稳定，调度才简单；
+2. **每个分区的调度器管理一个固定大小的 warp 池**——官方给的数字：Volta 每分区 16 个（每 SM 64 个）、Turing 每分区 8 个（每 SM 48 个）。这个池子的容量上限，正是 4.4.4 节占用率公式里的分母。
+
+**再看状态机。** 一个 warp 被映射进分区槽位后就称为**活跃/驻留的（active / resident）warp**。每个时钟周期，调度器检查自己池中所有活跃 warp 的状态，按"当下能不能开工"分流：
+
+```text
+                    ┌─────────── 活跃（active）warp 池 ───────────┐
+                    │                                            │
+   每周期检查 ──→   就绪（eligible）  ⇄   阻塞（stalled）          │
+                    │      │                                     │
+                    │      ▼ 每周期至多挑一个                      │
+                    │   选中（selected/issued）→ 发射指令           │
+                    └────────────────────────────────────────────┘
+   没有任何就绪 warp？→ 本周期发射槽空转（issue slot skipped）＝延迟没藏住
+```
+
+- **就绪的（eligible）warp**：官方给出了三个必要条件——**下一条指令已取出并译码、所有输入依赖已解决、目标执行单元有空位**，三者齐备才有资格被点名；
+- **选中的（selected / issued）warp**：调度器每周期**从就绪集合中至多挑一个** warp 发射其指令——被挑中的那一个；
+- **阻塞的（stalled）warp**：官方归纳的四大类等待——**等取指（instruction fetch）、等访存结果（memory dependency）、等前一条指令的结果（execution dependency）、等同步栅栏（synchronization barrier）**。
+
+调度器每个周期做的事就是：从就绪队列里挑 warp 发射指令。**延迟隐藏成立的条件，就是任意时刻就绪队列都不空**——只要总有 eligible warp 可发射，个别 warp 阻塞多久都无所谓，计算单元照样满负荷。反过来，官方原话说得很直白："若某个周期没有任何就绪 warp，该发射槽就被跳过、不发射任何指令——**大量被跳过的发射槽意味着糟糕的延迟隐藏**（Having many skipped issue slots indicates poor latency hiding）"。
+
+用车间类比串一遍：SM 里有 4 个**班组**（分区），每组有一本固定的**花名册**（warp 池，16 个名额）。每个周期班组长扫一眼花名册：在册的是 active；手里有图纸、原料到齐、工位空着的是 eligible；正在等仓库送料或等隔壁工序交活的是 stalled；组长每周期只能点一个人开工——点中的就是 selected。**点名点了个空（全组都在等料），这个周期就白白流走了。**
+
+#### 常见的 stall 原因：读懂 profiler 的"病历本"
+
+warp 具体在等什么？Nsight Compute 会按采样统计给出 *停滞原因（stall reasons）** 的分布。下面挑实践中最高频的几种（完整列表见官方 Warp Stall Reasons 文档），每种都附官方开出的"处方"：
+
+| Stall 原因 | 在等什么 | 官方处方（摘要） |
+|-----------|---------|----------------|
+| **Long Scoreboard** | L1TEX（全局/本地/纹理）**访存结果**——访存型内核最常见的头号原因 | 检查访存模式是否合并（第 5 章）、提高数据局部性、把高频数据搬进共享内存 |
+| **Short Scoreboard** | MIO 操作结果，典型是**共享内存**读写 | 排查共享内存 bank 冲突（第 5 章）、减少特殊数学函数/动态分支 |
+| **Barrier** | `__syncthreads()`，等块内最慢的同伴 | 分支路径不均导致有人迟到；把工作切均匀，块 ≥512 线程时考虑改小 |
+| **Wait** | **固定延迟**的执行依赖（等上一条算术指令出结果） | 占比高通常说明内核已高度优化；再想快就增加活跃 warp、循环展开挖 ILP（4.7 节） |
+| **Math Pipe Throttle** | 某条数学流水线**超订**（大家挤同一种运算单元） | 增加活跃 warp，或调整指令组合让各流水线均衡受力 |
+| **No Instruction** | 取指/指令缓存 miss | 常见于"不足一个 wave"的极短内核；超大内核频繁跳转也会触发 |
+| **Not Selected** | **已就绪但没被点中**（同周期别的 warp 被选走了） | **这不是病**——它说明就绪 warp 供过于求，延迟已藏好，甚至可考虑减 warp 换取更好的缓存局部性 |
+
+> [!TIP]
+> 读 stall 报告前先记住官方的两句提醒：① **"stall 不一定影响整体性能，也不可能完全消除"**——只要调度器每周期都有指令可发（`ncu` SchedulerStats 里 Issued Warp 接近每周期 1 个），warp 停滞再多也无妨；**只有当调度器出现大量空转周期时，才需要去追查主要的 stall 原因**。② Warp State Statistics 里的核心指标 **Warp Cycles Per Issued Instruction**（每发射一条指令、warp 平均耗掉多少周期）本质上就是"两条指令间的平均延迟"——**这个数字越大，需要的 warp 并行度就越高**，它直接把本节的状态机和下一节"要备多少 warp"连了起来。
 
 ### 4.4.3 需要多少个 warp 才能隐藏延迟
 
@@ -662,7 +700,7 @@ __global__ void reduceUnrollWarp8(int *g_idata, int *g_odata, unsigned int n) {
 - 线程块一旦分配给某个 SM 就不再迁移；寄存器按 warp、共享内存按块划拨，资源连一个块都放不下时**内核直接启动失败**；逻辑三层与硬件三层对应：Thread ↔ CUDA Core、Block ↔ SM、Grid ↔ Device；
 - Fermi 调度实景：2 个 Warp Scheduler 各配 1 个 Dispatch Unit，每周期各选一个**就绪** warp、各发射一条指令到"16 核心组 / 16 LD-ST / 4 SFU"三类目标之一；大多数指令可双发射，FP64 除外（要合并两组核心）；**warp 的 32 是逻辑调度宽度，物理 lane 数是各代架构的实现选择**——16 lane 分 2 拍消化一个 warp，该原则延续至今；
 - **执行的实质是 warp**：32 线程一组（`warp_id = tid / 32`、`lane_id = tid % 32`，多维索引先按 x→y→z 线性化），SIMT 方式同步执行同一条指令——SIMT 与 SIMD 的官方区别在于 **SIMD 把向量宽度暴露给软件，SIMT 的指令描述单个线程的行为**（warp 之于 CUDA ≈ 缓存行之于 CPU）；**lane 是线程在 warp 内终生不变的工位号（0~31）**，也是分化掩码（bit n ↔ lane n）、访存合并分析、warp 原语通信共同的坐标系；**Volta 起独立线程调度让每线程有独立 PC/调用栈**，warp-synchronous 假设失效，warp 内交换数据须用 `_sync` 原语或 `__syncwarp()`；
-- warp 切换零开销（状态常驻寄存器文件）→ 靠海量常驻 warp 隐藏延迟（官方 $4L$ 法则：现代架构隐藏 L 周期延迟约需 4L 条在途 warp 指令，算术延迟 ~4 周期 → 16 个活跃 warp 起步）→ 调度器每周期从活跃（active）warp 中挑就绪（eligible）者发射，阻塞（stalled）者等待；ILP（同 warp 内独立指令）与 TLP（换 warp）是隐藏延迟的两条腿；
+- warp 切换零开销（状态常驻寄存器文件）→ 靠海量常驻 warp 隐藏延迟（官方 $4L$ 法则：现代架构隐藏 L 周期延迟约需 4L 条在途 warp 指令，算术延迟 ~4 周期 → 16 个活跃 warp 起步）→ SM 分 4 个分区（SMSP），warp 终生驻留一个分区、由该分区调度器管理（Volta 每分区 16 槽位）；每周期状态机：活跃（active）→ 就绪（eligible，指令译码好/依赖解决/单元有空）→ 至多选中（selected）一个发射，其余阻塞（stalled）等待；**没有就绪 warp 的周期 = 发射槽空转 = 延迟没藏住**；stall 本身不是病，调度器发不满才需要查 stall 原因（Long/Short Scoreboard、Barrier、Not Selected 等）；ILP（同 warp 内独立指令）与 TLP（换 warp）是隐藏延迟的两条腿；
 - 占用率是延迟隐藏能力的代理指标（够用即可，不必 100%），受寄存器、共享内存、块大小三大因素限制且有"悬崖效应"（官方算例：64→65 个寄存器，占用率腰斩）；用 `nvcc --ptxas-options=-v` 看资源占用、occupancy API 拿推荐配置、`__launch_bounds__`/`-maxrregcount` 控寄存器、Nsight Compute 看实测占用率；
 - warp 内条件分支不一致 → **线程束分化** → 硬件按活跃掩码串行走完各分支（短分支编译器会谓词化：两边都执行、按谓词生效）；解法是让分支粒度对齐 warp——可行的前提是**块划分成 warp 的方式是确定的**（归约三版本演进：相邻配对 → 索引重排 → 交错配对，计算量不变、只改线程映射）；
 - `nvcc` 会自动展开**循环次数编译期已知**的小循环；边界依赖运行期值的循环（如归约的 stride 循环）需手工/`#pragma unroll` 展开：减少循环维护指令 + 增加独立指令提高指令级并行（展开数据块、展开最后的 warp——后者在 Volta+ 需配合 `__syncwarp()` 或改用 shuffle）；
@@ -689,6 +727,7 @@ __global__ void reduceUnrollWarp8(int *g_idata, int *g_odata, unsigned int n) {
 | CUDA C++ 编程指南：SM 级利用率与延迟隐藏（4.4.3 节 4L 法则、寄存器算例的出处） | https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#multiprocessor-level |
 | CUDA C++ 编程指南：控制流指令与分支谓词化（4.5 节的出处） | https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#control-flow-instructions |
 | CUDA C++ 最佳实践指南：执行配置优化（占用率、延迟隐藏） | https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#execution-configuration-optimizations |
+| Nsight Compute Profiling Guide：硬件模型与调度器统计（4.4.2 节 SMSP/active/eligible/selected 术语与 stall 原因的出处） | https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html |
 | 各代架构 Tuning Guide（每 SM 分区/通道数等实现差异） | https://docs.nvidia.com/cuda/index.html#programming-guides |
 
 ---
