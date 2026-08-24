@@ -393,7 +393,7 @@ stream_b.wait_event(event)      # stream_b 等待标记；CPU 不阻塞
 > [!NOTE]
 > PyTorch 的 `stream_b.wait_stream(stream_a)` 是 `wait_event` 的便捷形式：等价于在 `stream_a` 的**当前末尾**打一个 Event 并让 `stream_b` 等待它——注意它等待的是 `stream_a` 上**已提交的全部工作**，粒度较粗。6.6.4 节会看到这个粗粒度如何把一次小小的隐式同步"放大"成几十毫秒的等待。
 
-# 这两段代码在语义上完全等价：
+这两段代码在语义上完全等价：
 
 ```python
 # 写法 1：wait_stream（一步完成）
@@ -418,6 +418,13 @@ void CUDAStream::wait_stream(CUDAStream other) {
 }
 ```
 
+
+建议按这个顺序理解：
+- 第 1 步：理解 stream = 有序队列: 同一 stream 内操作串行，不同 stream 可以并行
+- 第 2 步：理解 event = stream 上的时间标记: record(stream) = 在 stream 的当前位置打一个标记,标记的含义 = "stream 上到此为止的所有操作都完成了"
+- 第 3 步：理解 wait_event = 一个 stream 等另一个 stream 上的标记 streamA.wait_event(ev) = streamA 暂停，直到 ev 对应的操作完成。注意：只是 GPU 侧暂停，CPU 不停
+- 第 4 步：理解 event.synchronize() = CPU 等标记，CPU 线程阻塞，直到 GPU 到达 event 位置。
+- 第 5 步：理解 wait_stream = wait_event 的快捷方式，streamA.wait_stream(streamB) = 自动在 streamB 末尾 record + streamA.wait_event，适用于 "等对方所有已入队操作" 的常见场景
 
 
 ### 6.4.4 事件的三大用途
