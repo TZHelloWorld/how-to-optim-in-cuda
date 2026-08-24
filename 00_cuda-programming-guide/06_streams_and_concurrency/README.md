@@ -393,6 +393,33 @@ stream_b.wait_event(event)      # stream_b 等待标记；CPU 不阻塞
 > [!NOTE]
 > PyTorch 的 `stream_b.wait_stream(stream_a)` 是 `wait_event` 的便捷形式：等价于在 `stream_a` 的**当前末尾**打一个 Event 并让 `stream_b` 等待它——注意它等待的是 `stream_a` 上**已提交的全部工作**，粒度较粗。6.6.4 节会看到这个粗粒度如何把一次小小的隐式同步"放大"成几十毫秒的等待。
 
+# 这两段代码在语义上完全等价：
+
+```python
+# 写法 1：wait_stream（一步完成）
+stream_b.wait_stream(stream_a)
+```
+```python
+# 写法 2：手动 event（两步完成）
+ev = torch.cuda.Event()
+with torch.cuda.stream(stream_a):
+    ev.record()  # 在 stream_a 当前位置打一个标记
+stream_b.wait_event(ev)  # stream_b 等这个标记
+```
+
+`CUDA Runtime` 内部，`cudaStreamWaitStream` 根本不存在——它就是用 `event` 实现的。`PyTorch` 的 `stream.wait_stream(other)` 源码大致是：
+
+```python
+// PyTorch C++ 内部实现（简化）
+void CUDAStream::wait_stream(CUDAStream other) {
+    CUDAEvent event;
+    event.record(other);        // 在 other 的当前位置 record
+    this->wait_event(event);    // 自己等这个 event
+}
+```
+
+
+
 ### 6.4.4 事件的三大用途
 
 CUDA Event 是**插入到流中的标记**：当流执行到该标记位置时，事件变为完成（completed）状态。官方打的比方很形象：Event 就像投进水流的**示踪粒子（tracer particle）**——粒子漂到哪，就说明水流（流中的任务）推进到了哪。生命周期五步：`cudaEventCreate → cudaEventRecord →（cudaEventQuery / cudaEventSynchronize）→ cudaEventDestroy`。
