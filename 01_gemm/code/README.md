@@ -95,6 +95,68 @@ python run_jit.py
 `test.py` / `run_jit.py` 用 `M=N=K=4096`（满足 sgemm_v5 的 128/8 整除约束），
 与 `A @ B`（cuBLAS）对比正确性，并测量 my_matmul 与 cuBLAS 的耗时与 TFLOPS。
 
+## 用 Nsight Compute（ncu）分析各版本 kernel
+
+GEMM 是典型的**计算受限**算子，优化目标是把计算吞吐（FMA / Tensor Core）逼近峰值。`ncu` 能逐 kernel 报告计算/访存吞吐、共享内存瓶颈、占用率，正好定量对比 V0~V7 每一步的收益。
+
+> 建议加 `-lineinfo` 便于源码定位：`nvcc -O3 -arch=sm_70 -lineinfo sgemm.cu -o sgemm`。`ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。
+
+### 快速总览（V0~V6 逐版对比）
+
+```bash
+ncu --set basic ./sgemm 1024        # 每个 kernel 一份报告，对比 Duration 与 Compute Throughput
+```
+
+### 按 kernel 名只测某几版
+
+各版本 kernel 名不同（形如 `sgemm_v0`…`sgemm_v6`；Tensor Core 版在 `hgemm_wmma`）：
+
+```bash
+# 只测 V2（首次分块）与 V4（二维 thread tiling）
+ncu -k "sgemm_v2|sgemm_v4" --set full ./sgemm 1024
+
+# 单独深挖 Tensor Core 版
+ncu -k "regex:.*wmma.*" --set full ./hgemm_wmma 1024
+```
+
+### 针对 GEMM 瓶颈的关键指标
+
+```bash
+ncu -k "regex:sgemm_v.*" \
+    --metrics \
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,\
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./sgemm 1024
+```
+
+| 指标 | 含义 | 对应优化点 |
+|------|------|-----------|
+| `sm__throughput...pct_of_peak` | SM 综合吞吐（Speed-of-Light 的 Compute） | 计算受限算子的头号目标 |
+| `sm__pipe_fma_cycles_active...pct_of_peak` | FMA 流水线繁忙度 | V3/V4 提升 FMA 占比、降低 LDS 占比 |
+| `gpu__dram_throughput...pct_of_peak` | DRAM 带宽 | V2 共享内存分块后应显著下降（复用起效） |
+| `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` | 共享内存 bank 冲突 | V5 的 As 转置存储 / float4 用来规避冲突 |
+
+Tensor Core 版（V7）额外关注 Tensor 流水线利用率：
+
+```bash
+ncu -k "regex:.*wmma.*" \
+    --metrics sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \
+    ./hgemm_wmma 1024
+```
+
+### 常用配套选项
+
+```bash
+ncu -o sgemm_report -f --set full ./sgemm 1024        # 存 .ncu-rep，用 ncu-ui 打开
+ncu --section SpeedOfLight ./sgemm 1024               # 只看 Speed-of-Light 概览
+ncu --launch-count 1 -k sgemm_v4 ./sgemm 1024          # 只抓一次启动
+```
+
+> 大矩阵（如 `./sgemm 4096`）在 full 模式下 profiling 较慢，建议先用小规模 + `--launch-count 1` 定位问题。若报 `ERR_NVGPUCTRPERM`，用 `sudo ncu ...` 或让管理员放开性能计数器权限。
+
 ## 说明
 
 - 所有 kernel 算法逻辑严格忠实于文档，仅补充了可编译运行所需的上下文：头文件、

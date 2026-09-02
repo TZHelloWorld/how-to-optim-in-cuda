@@ -100,3 +100,45 @@ copy_scale_relu 最大误差: 0.000e+00
 python profile_copy_paths.py
 # 表中可见 Memcpy DtoD（CE）与 vectorized_elementwise_kernel（SM）
 ```
+
+## 用 Nsight Compute（ncu）分析拷贝 kernel
+
+拷贝是**纯访存受限**的算子，唯一目标就是逼近 DRAM 峰值带宽。`ncu` 能逐 kernel 报告实际带宽、在途请求、指令数，定量对比 V0~V3。
+
+> 注意：`cudaMemcpy` 走的是 **Copy Engine（CE）**，不是 SM kernel，`ncu` 抓不到它（它不是 kernel launch）——CE 路径请用 `nsys` 或上面的 `profile_copy_paths.py` 观察。`ncu` 只分析 V0~V3 这些**走 SM 的拷贝 kernel**。建议加 `-lineinfo`：`nvcc -O3 -arch=native -lineinfo copy_bench.cu -o copy_bench`。`ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。
+
+```bash
+# 总览：逐 kernel 对比 Duration 与 Memory Throughput
+ncu --set basic ./copy_bench 67108864
+
+# 只测某几版（kernel 名：copy_naive / copy_gridstride / copy_float4 / copy_scale_relu）
+ncu -k "copy_float4|copy_scale_relu" --set full ./copy_bench 67108864
+```
+
+纯访存算子最该盯的就是带宽和访存效率：
+
+```bash
+ncu -k "regex:copy_.*" \
+    --metrics \
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes.sum,\
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+smsp__inst_executed.sum,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./copy_bench 67108864
+```
+
+| 指标 | 观察点 |
+|------|--------|
+| `gpu__dram_throughput...pct_of_peak` | 头号指标：`copy_float4`（LDG.128）应接近峰值，`copy_gridstride` 并发不足时偏低 |
+| `dram__bytes.sum` | 读+写总流量，应 ≈ `2N`；明显偏大说明有非合并访问拉了无用数据 |
+| `smsp__inst_executed.sum` | `copy_float4` 让指令数降到约 `copy_naive` 的 1/4（一条指令搬 16 字节） |
+| `sm__warps_active...pct_of_peak` | 占用率，解释 `copy_gridstride` 为何反而最慢（并发不足） |
+
+`h2d_pipeline`（H2D 分块流水，CE 与 SM 重叠）属于**多流重叠**场景，重点是时间线上引擎是否并行——这类分析用 `nsys profile ./h2d_pipeline` 看时间线更直观，`ncu` 适合深挖其中单个 SM kernel。
+
+```bash
+ncu -o copy_report -f --set full ./copy_bench 67108864   # 存 .ncu-rep 用 ncu-ui 打开
+```
+
+> 若报 `ERR_NVGPUCTRPERM`（性能计数器权限不足），用 `sudo ncu ...` 或让管理员放开权限；仅 `--set basic` 通常无需特殊权限。

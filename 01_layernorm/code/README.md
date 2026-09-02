@@ -94,3 +94,43 @@ python run_jit.py
 | 两遍扫描 | 2 | 最好 | V0 |
 | 单遍 `E[x²]-μ²` | 1 | 差（μ≫σ 时崩溃） | V1~V4、扩展 kernel |
 | Welford + 并行合并 | 1 | 好 | `layernorm_welford` |
+
+## 用 Nsight Compute（ncu）分析各版本 kernel
+
+LayerNorm 是**访存受限**算子，核心目标是把 `x` 的读取遍数压到下限、逼近 DRAM 峰值带宽。`ncu` 能逐 kernel 报告带宽、归约分化、bank 冲突、占用率，定量验证 V0→V4 每一步的收益。
+
+> 建议加 `-lineinfo`：`nvcc -O3 -arch=sm_70 -lineinfo layernorm.cu -o layernorm`。`ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。
+
+```bash
+# 总览：每个 kernel 一份报告，对比 Duration 与 Memory Throughput
+ncu --set basic ./layernorm 4096 4096
+
+# 只测某几版（kernel 名形如 layernorm_v0…v4、layernorm_welford）
+ncu -k "layernorm_v0|layernorm_v4" --set full ./layernorm 4096 4096
+```
+
+针对访存型归约算子的关键指标：
+
+```bash
+ncu -k "regex:layernorm_.*" \
+    --metrics \
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes_read.sum,\
+smsp__average_inst_executed_per_warp.ratio,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./layernorm 4096 4096
+```
+
+| 指标 | 观察点 |
+|------|--------|
+| `gpu__dram_throughput...pct_of_peak` | V3 float4 / V4 行驻留后应接近峰值 |
+| `dram__bytes_read.sum` | 直接印证"x 读取遍数"：V0 读 3 遍字节数最大，V4 逼近 1 遍下限 |
+| `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` | V2 Warp Shuffle 归约应比 V0 共享内存树形归约冲突更少 |
+| `sm__warps_active...pct_of_peak` | 占用率，反映延迟隐藏 |
+
+```bash
+ncu -o layernorm_report -f --set full ./layernorm 4096 4096   # 存 .ncu-rep 用 ncu-ui 打开
+```
+
+> 若报 `ERR_NVGPUCTRPERM`（性能计数器权限不足），用 `sudo ncu ...` 或让管理员放开权限；仅 `--set basic` 通常无需特殊权限。

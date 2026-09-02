@@ -69,3 +69,62 @@ python run_jit.py
 自定义 kernel 结果: 67108864.0
 PyTorch sum 结果:   67108864.0
 ```
+
+## 用 Nsight Compute（ncu）分析各版本 kernel
+
+`ncu` 是 NVIDIA 官方的 kernel 级 profiler，能逐个 kernel 报告耗时、访存带宽、占用率、warp 分化、bank 冲突等硬件指标——正好用来定量验证 V0~V7 每一步优化到底改善了哪个瓶颈。
+
+> 前提：编译时加 `-lineinfo` 可让报告关联到源码行（`nvcc -O3 -arch=sm_70 -lineinfo reduce.cu -o reduce`）。若 `ncu` 不在 PATH，用绝对路径 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`；非 root 环境如提示权限不足，见文末说明。
+
+### 快速总览（所有 kernel 的耗时与吞吐）
+
+```bash
+# --set basic 只收集轻量指标，开销小、适合先看全局
+ncu --set basic ./reduce 1048576
+```
+
+程序会依次跑 V0~V7 八个 kernel，`ncu` 为每个 kernel 各打印一份报告——对比它们的 Duration 与 Compute/Memory Throughput，即可看出逐版优化的效果。
+
+### 只测某几个版本（按 kernel 名过滤）
+
+reduce 的 8 个版本 kernel 名各不相同（形如 `reduce_v0`、`reduce_v1`…）。用 `-k` 正则只测感兴趣的版本，避免全量分析太慢：
+
+```bash
+# 只分析 V0 和 V2（正则匹配 kernel 名）
+ncu -k "reduce_v0|reduce_v2" --set full ./reduce 1048576
+
+# 每个匹配到的 kernel 只测第一次启动，避免重复
+ncu -k "regex:reduce_v.*" -c 8 --set full ./reduce 1048576
+```
+
+### 针对 reduce 瓶颈的关键指标
+
+reduce 是典型的**访存受限 + 归约分化/冲突**算子，重点看这几组指标：
+
+```bash
+ncu -k "regex:reduce_v.*" \
+    --metrics \
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+smsp__average_inst_executed_per_warp.ratio,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./reduce 1048576
+```
+
+| 指标 | 含义 | 在 reduce 里对应的优化点 |
+|------|------|------------------------|
+| `gpu__dram_throughput...pct_of_peak` | DRAM 带宽利用率 | V7 float4 + grid-stride 后应接近峰值 |
+| `smsp__average_inst_executed_per_warp` | 每 warp 平均指令数 | 分化越重该值越高（V0→V1 明显下降） |
+| `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` | 共享内存 bank 冲突次数 | V2 消除冲突后应降为 0 |
+| `sm__warps_active...pct_of_peak` | 达成占用率 | 反映延迟隐藏是否充分 |
+
+### 常用配套选项
+
+```bash
+ncu -o reduce_report -f --set full ./reduce 1048576   # 结果存成 reduce_report.ncu-rep，用 ncu-ui 打开
+ncu --section SpeedOfLight ./reduce 1048576            # 只看 Speed-of-Light 概览
+ncu --launch-count 1 -k reduce_v7 ./reduce 1048576     # 只抓一次启动
+```
+
+> **权限问题**：若报 `ERR_NVGPUCTRPERM`（无法访问性能计数器），需 root 运行（`sudo ncu ...`）或让管理员放开权限（Linux 参见 NVIDIA 文档设置 `NVreg_RestrictProfilingToAdminUsers=0`）。仅收集 `--set basic`/launch 级指标时通常不需要特殊权限。

@@ -97,3 +97,45 @@ python attention_variants.py
 | 每 token 每层 Cache（元素） | `2hd` | `2d` | `2gd` | `d_c + d_r` |
 | 质量 | 基准 | 有损 | ≈ MHA（`g≥8`） | 报告 ≥ MHA |
 | 代表模型 | GPT-2、LLaMA-1 | PaLM、StarCoder | LLaMA-2/3、Qwen2 | DeepSeek-V2/V3/R1 |
+
+## 用 Nsight Compute（ncu）分析 CUDA kernel
+
+Attention 优化的核心是**用 kernel 融合消除 N×N 中间矩阵的 HBM 往返**（V0 三 kernel → V1 融合 softmax → V3/V4 FlashAttention）。`ncu` 能逐 kernel 报告耗时、访存量、占用率、warp 通信开销，定量印证融合到底省了多少显存流量。
+
+> 建议加 `-lineinfo`：`nvcc -O3 -arch=sm_70 -lineinfo attention.cu -o attention`。`ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。V0 会启动 QKᵀ/softmax/PV 三个 kernel，融合版只有一个——报告里的 kernel 数量本身就是融合效果的直接体现。
+
+```bash
+# 总览：逐 kernel 对比 Duration 与 Memory Throughput
+ncu --set basic ./attention 1024 64 1
+
+# 只测某个版本（各版本 kernel 名不同，先用 --set basic 跑一遍看实际名字，再用 -k 过滤）
+ncu -k "regex:.*flash.*|.*attn_v4.*" --set full ./attention 1024 64 1
+
+# Flash-Decoding 的两个 kernel（partial + reduce）
+ncu -k "decode_partial|decode_reduce" --set full ./flash_decoding 8 2048 128 16
+```
+
+针对 Attention 的关键指标：
+
+```bash
+ncu --set full \
+    --metrics \
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes.sum,\
+sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./attention 1024 64 1
+```
+
+| 指标 | 观察点 |
+|------|--------|
+| `dram__bytes.sum` | 全 kernel 显存总流量：V0 因 N×N 矩阵落地 HBM 最大，Flash 版（V3/V4）显著更小 |
+| `gpu__dram_throughput...pct_of_peak` | 融合后是否转为计算受限 |
+| `sm__pipe_fma_cycles_active...pct_of_peak` | FlashAttention 计算流水线繁忙度 |
+| `sm__warps_active...pct_of_peak` | 占用率；V4 split-Q（一 Warp 一行）改善片上并行度 |
+
+```bash
+ncu -o attention_report -f --set full ./attention 1024 64 1   # 存 .ncu-rep 用 ncu-ui 打开
+```
+
+> PyTorch 侧（`attention_variants.py` / `flash_attention_sim.py`）属于框架算子，用 `ncu python xxx.py` 也能抓，但更推荐用 `torch.profiler` 或 `nsys` 看整体时间线；ncu 更适合上面这些自写 CUDA kernel 的单核深挖。若报 `ERR_NVGPUCTRPERM`，用 `sudo ncu ...` 或让管理员放开性能计数器权限。

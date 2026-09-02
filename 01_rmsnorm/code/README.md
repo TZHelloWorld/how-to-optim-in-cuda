@@ -95,6 +95,49 @@ python run_jit.py
 `test.py` 用 `torch.nn.RMSNorm`（PyTorch >= 2.4）等价的参考实现对拍，
 fp32 预期最大绝对误差在 `~1e-6` 量级。
 
+## 用 Nsight Compute（ncu）分析各版本 kernel
+
+RMSNorm 与 LayerNorm 同属**访存受限**归约算子，优化目标是压低 `x` 读取遍数、逼近 DRAM 峰值带宽。`ncu` 逐 kernel 报告带宽、分化、bank 冲突、占用率，定量对比 V0→V4。
+
+> 建议加 `-lineinfo`：`nvcc -O3 -arch=sm_70 -lineinfo rmsnorm.cu -o rmsnorm`。`ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。
+
+```bash
+# 总览：逐 kernel 对比 Duration 与 Memory Throughput
+ncu --set basic ./rmsnorm 4096 4096
+
+# 只测某几版（kernel 名形如 rmsnorm_v0…v3）
+ncu -k "rmsnorm_v0|rmsnorm_v2" --set full ./rmsnorm 4096 4096
+
+# 融合版单独分析（读 x+residual、写 h+y，看带宽是否吃满）
+ncu -k "regex:.*fused.*" --set full ./fused_add_rmsnorm 4096 4096
+```
+
+针对访存型归约算子的关键指标：
+
+```bash
+ncu -k "regex:rmsnorm_.*" \
+    --metrics \
+gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes_read.sum,\
+smsp__average_inst_executed_per_warp.ratio,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+    ./rmsnorm 4096 4096
+```
+
+| 指标 | 观察点 |
+|------|--------|
+| `gpu__dram_throughput...pct_of_peak` | V2 float4 + 行驻留后应接近峰值 |
+| `dram__bytes_read.sum` | 印证读取遍数：V0/V1 读 2 遍，V2/V3 逼近 1 遍下限 |
+| `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` | V1 Warp Shuffle 归约相比 V0 共享内存树形归约冲突更少 |
+| `sm__warps_active...pct_of_peak` | 占用率；V3"短行一 Warp"针对 decode 小 batch 提升并行度 |
+
+```bash
+ncu -o rmsnorm_report -f --set full ./rmsnorm 4096 4096   # 存 .ncu-rep 用 ncu-ui 打开
+```
+
+> 若报 `ERR_NVGPUCTRPERM`（性能计数器权限不足），用 `sudo ncu ...` 或让管理员放开权限；仅 `--set basic` 通常无需特殊权限。
+
 ## 混合精度说明（第 9 章）
 
 文档第 9.1 节给出 fp16/bf16 的正确姿势：**读写用半精度、平方和用 fp32 累加**

@@ -58,6 +58,28 @@ NeoX vs GPT-J 输出 max_diff = 2.1737（应显著非零）
 pip install torch
 ```
 
+## 用 Nsight Compute（ncu）分析（可选）
+
+本目录的 `rope.py` 是**纯 PyTorch 实现**，没有自写 CUDA kernel，因此运行时跑的是
+PyTorch 内部的 elementwise / gather 等算子。若想看这些算子的 GPU 硬件指标，`ncu`
+可以直接把 Python 进程作为目标：
+
+```bash
+# 用 kernel 名过滤，避免抓到框架启动阶段成百上千个无关 kernel
+ncu -k "regex:.*rope.*|.*rotary.*|.*elementwise.*" --set basic python rope.py
+
+# 或只抓前若干个 kernel 快速看一眼
+ncu -c 20 --set basic python rope.py
+```
+
+> `ncu` 若不在 PATH，用 `/usr/local/NVIDIA-Nsight-Compute/ncu` 或 `/usr/local/cuda/bin/ncu`。
+> 对纯 PyTorch 代码，**更推荐先用 `torch.profiler` 或 `nsys profile python rope.py`
+> 看整体时间线**（哪些算子最耗时、是否有多余的 H2D 拷贝/同步），定位到热点算子后再用
+> `ncu` 深挖该 kernel 的访存/占用率。RoPE 属于访存受限的轻量算子，实践中通常与
+> attention/QKV 投影**融合**后才有单独优化价值——真正要 profile 的往往是融合后的
+> kernel（参见 `01_attention/code` 里自写 CUDA kernel 的 ncu 分析）。
+> 若报 `ERR_NVGPUCTRPERM`（性能计数器权限不足），用 `sudo ncu ...` 或让管理员放开权限。
+
 ## 说明
 
 代码忠实于文档 4.2~4.5 节与第 6 章的实现，核心算法逻辑未做改动；仅补充了
