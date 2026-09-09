@@ -306,7 +306,7 @@ C Extension 无第三方依赖、直接操作 CPython API，提供**最底层的
 
 ### 4.1 定位
 
-[pybind11](https://pybind11.readthedocs.io/en/stable/) 是一个**纯头文件（header-only）**的 C++ 库，用现代 C++（模板元编程）把第 3 章的样板代码全部自动化：`PYBIND11_MODULE` 宏在编译期展开为完整的 `PyInit_*` 入口、方法表与类型转换代码。
+[pybind11](https://pybind11.readthedocs.io/en/stable/) 是一个 **纯头文件（header-only）** 的 C++ 库，用现代 C++（模板元编程）把第 3 章的样板代码全部自动化：`PYBIND11_MODULE` 宏在编译期展开为完整的 `PyInit_*` 入口、方法表与类型转换代码。
 
 - 要求 C++11 及以上；支持 CPython 3.8+、PyPy3 7.3.17+、GraalPy 24.1+；
 - 核心头文件仅约 4K 行，是 Boost.Python 的轻量替代品。
@@ -755,6 +755,19 @@ cd sglang/sgl-kernel
 make build -j8
 pip install dist/sgl_*.whl --force-reinstall
 ```
+
+安装成功后，可以检查一下是否注册成功:
+```python
+import torch
+
+print(torch._C._dispatch_has_kernel("sgl_kernel::moe_fused_gate"))     # False
+
+from sgl_kernel import moe_fused_gate  # 需要手动导入某个算子才能用
+
+print(torch._C._dispatch_has_kernel("sgl_kernel::moe_fused_gate"))     # True
+```
+
+
 
 ### 8.2 目录组织
 
