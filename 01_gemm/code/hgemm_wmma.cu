@@ -1,7 +1,7 @@
 // hgemm_wmma.cu — CUDA HGEMM（半精度矩阵乘）Tensor Core / WMMA 实现
 //
 // 对应文档: ../cuda_gemm_optimization_guide.md 第 11 章（V7）
-//   V7 Tensor Core（WMMA）—— 一条 mma 指令完成 16×16×16 小矩阵乘加
+//   V7 Tensor Core（WMMA）—— 一次 Warp 级操作完成 16×16×16 小矩阵乘加
 //
 // A: M×K (half, row-major)  B: K×N (half, row-major)  C: M×N (float)
 // 要求 M、N、K 均为 16 的倍数。
@@ -40,7 +40,7 @@ using namespace nvcuda;
 // ===========================================================================
 // V7：Tensor Core WMMA 最小可用实现（第 11.3 节）
 // 每个 Warp 负责 C 的一个 16×16 块；每次 load_matrix_sync 直接打到全局内存
-// （相当于 Tensor Core 世界的 "V0"，数据零复用）
+// （块内有复用，但尚未建立跨 Warp 的显式共享与搬运流水线）
 // blockDim = (128, 4)：x 方向 4 个 Warp，y 方向 4 个 Warp，共 16 块/Block
 // ===========================================================================
 __global__ void hgemm_wmma_v7(int M, int N, int K,
@@ -48,6 +48,9 @@ __global__ void hgemm_wmma_v7(int M, int N, int K,
     // 每个 Warp 负责一个 16×16 输出块
     int warpN = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // 块列号
     int warpM = blockIdx.y * blockDim.y + threadIdx.y;         // 块行号
+
+    // grid 向上取整会产生多余 Warp；整个 Warp 一致退出
+    if (warpM * WMMA_M >= M || warpN * WMMA_N >= N) return;
 
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> aFrag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> bFrag;
@@ -58,7 +61,7 @@ __global__ void hgemm_wmma_v7(int M, int N, int K,
         // 全 Warp 协作加载 A、B 的 16×16 块（第三个参数是行跨度）
         wmma::load_matrix_sync(aFrag, A + warpM * WMMA_M * K + k, K);
         wmma::load_matrix_sync(bFrag, B + k * N + warpN * WMMA_N, N);
-        // 一条 mma：16×16×16 = 4096 次乘加
+        // 一次 Warp 级逻辑操作：16×16×16 = 4096 次乘加
         wmma::mma_sync(cFrag, aFrag, bFrag, cFrag);
     }
 

@@ -137,7 +137,7 @@ GPU 硬件并不逐个调度线程，而是以 **Warp（按线性编号连续的
 
 1. **Warp Divergence（线程束分化）**：若同一 Warp 内的线程走了不同分支，硬件必须依次执行所有分支路径（不参与的线程结果被屏蔽），分支越多性能越差；
 2. **访存以 Warp 为单位发出**：一个 Warp 的 32 个线程各自的地址会被硬件合并成内存事务（详见 2.4 节），32 个地址的"形状"决定了访存效率；
-3. **Warp 内天然同步**：同一 Warp 的 32 个线程步调一致，Warp 内部通信不需要 `__syncthreads()`。
+3. **Warp 内通信也要遵守同步规则**：Volta 起支持独立线程调度，不能依赖隐式锁步来保证共享内存读写顺序；Warp 内通过共享内存通信应按需使用 `__syncwarp()`，跨 Warp 则通常需要 `__syncthreads()`。第 11 章的 WMMA 还要求整个 Warp 一致参与其集体操作。
 
 一个 256 线程的 Block 包含 8 个 Warp：Warp 0 = tid 0~31，Warp 1 = tid 32~63，以此类推。对于二维 Block(32, 32)，按 2.1 节的拉平规则，**每个 Warp 恰好是 `threadIdx.y` 相同、`threadIdx.x` 从 0 到 31 的一行线程**。
 
@@ -449,7 +449,10 @@ V5: float4 向量化读写 + As 转置存储，访存指令数减为 1/4
 V6: 双缓冲（Double Buffering），搬运与计算流水线重叠
  │   瓶颈：CUDA Core 的 fp32 FFMA 吞吐本身成为天花板
  ▼
-V7: Tensor Core（WMMA），专用矩阵乘硬件，半精度吞吐 ~8-16 倍
+V7: Tensor Core（WMMA），改用专用矩阵乘硬件（混合精度）
+ │   后续仍需分块复用与流水线，才能充分利用更高的计算吞吐
+ ▼
+进阶（11.6 节）: Hopper TMA 搬运 + 多级流水 + Warp Specialization
 ```
 
 各版本解决的瓶颈分类：
@@ -1201,7 +1204,7 @@ __global__ void sgemm_v5(int M, int N, int K,
 
 代价是共享内存翻倍（8 KB → 16 KB）与几个额外的暂存寄存器——按 2.7 节的资源账，对占用率的影响通常可以接受。
 
-> 现代架构（Ampere+）提供 `cp.async` 指令，能把 global→smem 的拷贝完全绕过寄存器、异步进行，配合 `cuda::pipeline` 可以实现更深的多级流水；Hopper 更进一步提供 TMA 硬件拷贝引擎。双缓冲是理解这一切的概念原型。
+> 现代架构（Ampere+）提供 `cp.async` 指令，能把 global→smem 的拷贝完全绕过寄存器、异步进行，配合 `cuda::pipeline` 可以实现更深的多级流水；Hopper 更进一步提供 TMA 硬件拷贝引擎。双缓冲是理解这一切的概念原型，第 11.6 节将接着这条搬运路径展开。
 
 ### 10.4 至此的性能位置
 
@@ -1215,32 +1218,116 @@ V6 在多数架构上可达 cuBLAS SGEMM 的 **80%~90%**。剩余差距来自更
 
 ### 11.1 为什么需要专用硬件
 
-V6 之后，指令流已以 FFMA 为主，性能上限就是 CUDA Core 的 fp32 FMA 吞吐。但 GEMM 太重要了，NVIDIA 从 Volta 起加入 **Tensor Core**：一条指令完成一个**小矩阵块的乘加**（如 16×16×16），而不是一个标量乘加：
+前六次优化一直在做同一件事：减少搬运、增加复用，让更多时间花在 FFMA 上。到 V6，若数据供给已足够充分，再减少几条访存指令，收益也会越来越小——**因为负责计算的仍然是 CUDA Core，最终受限于它的 fp32 FMA 吞吐**。
+
+下一步能不能连计算本身也加速？GEMM 的运算结构高度规则：一组 A 元素与一组 B 元素反复交叉相乘，累加到一个矩形输出块。NVIDIA 从 Volta 起加入 **Tensor Core**，用专门的硬件处理这种小矩阵乘加，把程序表达计算的粒度从"一个数"提高到"一个块"：
 
 ```
-CUDA Core:   d = a * b + c          （标量 FMA，每周期每 core 2 FLOP）
-Tensor Core: D = A × B + C          （16×16×16 矩阵 FMA，一条指令 8192 FLOP）
+CUDA Core 路径：  d = a × b + c          ← 标量乘加
+Tensor Core 路径：D = A × B + C          ← 小矩阵乘加
+
+以 16×16×16 的操作为例：
+    A: 16×16，B: 16×16，C/D: 16×16
+    256 个输出，每个累加 16 项 → 4096 次乘加 = 8192 FLOP
 ```
 
-同代硬件上，半精度 Tensor Core 吞吐通常是 fp32 CUDA Core 的 **8~16 倍**。深度学习训练/推理中的 GEMM 几乎全部跑在 Tensor Core 上（fp16/bf16/tf32/fp8 输入，fp32 累加）。
+本章采用最常见的入门配置：**A/B 用 half（fp16）存储，乘积以 float（fp32）累加，C 也输出 float**。低精度 Tensor Core 的矩阵吞吐通常显著高于 CUDA Core 的 fp32 吞吐，同时输入每元素从 4 字节降到 2 字节，搬运负担也随之减轻。
 
-### 11.2 编程接口：WMMA
+代价是输入精度降低：fp32 累加能减轻长点积的累加误差，却不能恢复输入转成 half 时丢失的信息。因此 V7 是**计算路径与精度选择的变化**，性能要与相同精度配置的 cuBLAS 比较，不能直接接在 fp32 版本的加速比后面。
 
-CUDA 通过 `nvcuda::wmma` 命名空间暴露 Tensor Core，以 **Warp 为操作单位**——一个 Warp 的 32 个线程协作持有一个小矩阵块（数据如何分布在 32 个线程的寄存器中由硬件决定，程序员不可见，这个抽象叫 **fragment**）：
+> 这里的 16×16×16 是程序看到的逻辑运算形状。一次矩阵 API 调用会由编译器展开成目标架构上的指令序列，不等于"一个物理 Tensor Core 在一个周期内完成 8192 FLOP"。第 2.9 节区分过 C++、PTX 与 SASS，在这里仍然适用。
 
-| API | 作用 |
-|-----|------|
-| `wmma::fragment<>` | 声明矩阵片段（matrix_a / matrix_b / accumulator） |
-| `wmma::load_matrix_sync` | 全 Warp 协作，从内存加载一个 16×16 块到 fragment |
-| `wmma::mma_sync` | 执行 D = A×B + C |
-| `wmma::store_matrix_sync` | 把累加器 fragment 写回内存 |
-| `wmma::fill_fragment` | 初始化累加器（通常置 0） |
+### 11.2 预备理解：从"一个线程算"到"一个 Warp 合作算"
+
+CUDA 通过 **WMMA（Warp Matrix Multiply-Accumulate，线程束级矩阵乘累加）** 提供这类小矩阵操作：包含 `<mma.h>`，使用 `nvcuda::wmma` 命名空间即可。本章的 half 混合精度路径从支持 Tensor Core 的 Volta（计算能力 7.0）起可用。
+
+使用接口之前，先把它的工作分工想清楚。前文经历了两次变化：
+
+```
+V0：一个线程负责 C 的一个元素      → 持有一个 float acc
+V4：一个线程负责 C 的 8×8 块       → 持有 float acc[8][8]
+V7：一个 Warp 负责 C 的 16×16 块   → 32 个线程共同持有一个累加器块
+```
+
+这里最容易产生的疑问是：**既然按 Warp 分工，是不是就不考虑里面的 32 个线程了？** 恰好相反，32 个线程全都要参与，只是块内的分工由 WMMA 接管了。
+
+#### 11.2.1 输出块属于 Warp，数据仍然住在线程寄存器里
+
+假设 Warp 0 负责 C 左上角的 16×16 区域。它需要 A 的前 16 行与 B 的前 16 列，沿 K 每次取 16 个元素做一段乘加：
+
+```
+                         同一个 16×16 输出块，一直累加到 K 结束
+                                      ↑
+k = 0：   A[行 0~15，列  0~15] × B[行  0~15，列 0~15]
+k = 16：  A[行 0~15，列 16~31] × B[行 16~31，列 0~15]
+...
+
+逻辑上：一个 16×16 累加器块，共 256 个结果
+物理上：分散在 Warp 内 32 个线程各自的寄存器中
+```
+
+这个"分散在各线程中的矩阵片段"就叫 **fragment**。每个线程在代码里都声明一个 `cFrag`，但它只持有整个矩阵块的一部分；**32 份线程局部数据合起来，才表示 Warp 正在计算的那个块**。
+
+从存储规模看，256 个 fp32 累加值摊到 32 个线程，平均每线程 8 个。可是"线程 0 拿哪 8 个、线程 1 拿哪 8 个"，WMMA 没有规定可供程序依赖的坐标映射，也不要求程序员手工安排。这一点与 V4 的 `acc[i][j]` 不同：V4 的 i/j 可以推回明确的输出坐标，fragment 的内部下标不能这样解释。
+
+可以把它理解为：V4 是"每人独立算一张小表"，WMMA 是"32 人共同完成一张表，内部如何分栏由工具安排"。**程序员仍然决定哪一组人负责哪张表，只是不再手工指定组内每个人负责哪几个格子。**
+
+#### 11.2.2 计算也要全 Warp 一起发起
+
+数据分散在 32 个线程中，矩阵乘自然也要由这 32 个线程共同执行。代码里写一次：
+
+```cuda
+wmma::mma_sync(cFrag, aFrag, bFrag, cFrag);   // Cfrag = Afrag × Bfrag + Cfrag
+```
+
+执行时，Warp 内全部线程都走到这里，把各自持有的片段交给同一次 Warp 级运算。它既不是"一个线程做完整个矩阵乘"，也不是"32 个线程把同一矩阵乘重复做 32 遍"。
+
+这就是 `_sync` 后缀在这里提醒的事情：**整个 Warp 必须一致参与**。`laneId` 是线程在 Warp 内的编号（0~31），不能用 `if (laneId == 0)` 只让一个线程调用，也不能让部分线程先返回、剩下的线程继续调用。WMMA 的 load/store 还要求同一 Warp 传入相同的矩阵起点、步长和布局；接口会负责把这块矩阵分发到各线程的局部存储中。
+
+线程号仍有用：计算 `warpId` 要用它，协作搬入共享内存和处理输出边界时也要用它。被接口隐藏的是**矩阵块内部的元素分配**，不是 CUDA 的线程执行模型。
+
+#### 11.2.3 把矩阵块写成代码
+
+WMMA 的基本流程仍然是前文熟悉的"准备操作数 → 累加 → 写回"，只是操作数换成 fragment：
+
+```cuda
+wmma::fragment<wmma::matrix_a,    16, 16, 16, half, wmma::row_major> aFrag;
+wmma::fragment<wmma::matrix_b,    16, 16, 16, half, wmma::row_major> bFrag;
+wmma::fragment<wmma::accumulator, 16, 16, 16, float> cFrag;
+```
+
+三个数字是一次乘加的 `(m,n,k)`：A 为 m×k，B 为 k×n，累加器为 m×n。`matrix_a / matrix_b / accumulator` 指定角色，`half / float` 指定类型，`row_major` 指定输入矩阵在**内存中**按行存放；累加器的内存布局则在写回时指定。
+
+| 步骤 | API | 对应前文的动作 |
+|------|-----|----------------|
+| 清零 | `fill_fragment(cFrag, 0.0f)` | `acc = 0`，全 Warp 各清零自己的部分 |
+| 加载 | `load_matrix_sync(frag, ptr, ldm)` | 从 global 或 shared 读取操作数 |
+| 累加 | `mma_sync(cFrag, aFrag, bFrag, cFrag)` | 用一次小矩阵乘替代一组标量 FMA |
+| 写回 | `store_matrix_sync(ptr, cFrag, ldm, layout)` | 将完整输出块按指定布局存回内存 |
+
+其中 `ldm`（leading dimension）就是前文地址公式中的**行跨度，单位为元素**。例如从 M×K 的行主序 A 中取一个 16×16 子块，相邻两行起点仍相隔 K 个元素，所以传 K，而不是 16。子块变小，不会改变原矩阵的存储跨度。
+
+> WMMA 只接受硬件支持的类型与尺寸组合，不能任意改变这三个数字。后续架构还支持 BF16、TF32 等路径；例如 WMMA 的 TF32 配置使用 16×16×8，并需要相应的输入精度转换。本章先固定 half×half→float、16×16×16，把数据流讲清楚，其他组合可查章末官方类型表。
 
 ### 11.3 最小可用实现
 
-每个 Warp 负责 C 的一个 16×16 块，结构与 V0 惊人地相似——只是"线程算一个标量"换成了"Warp 算一个 16×16 块"：
+现在把上面的分工落实为代码。每个 Warp 算一个 16×16 输出块，沿 K 每次推进 16；为先看清计算过程，A/B 直接从全局内存加载。与前文一样，三者按行主序存储，这里要求 M、N、K 是正的 16 的倍数。
+
+启动配置取 `blockDim=(128,4)`。按 2.1 节的拉平规则，同一个 `threadIdx.y` 下，x 方向每连续 32 个线程组成一个 Warp。因此一个 Block 有 **4 行 × 4 列 = 16 个 Warp**，负责 C 的 64×64 区域：
+
+```
+                         C 的列方向
+                   0~15  16~31 32~47 48~63
+threadIdx.y = 0：  [ W0 ][ W1 ][ W2 ][ W3 ]   ← C 行  0~15
+threadIdx.y = 1：  [ W4 ][ W5 ][ W6 ][ W7 ]   ← C 行 16~31
+threadIdx.y = 2：  [ W8 ][ W9 ][W10 ][W11 ]   ← C 行 32~47
+threadIdx.y = 3：  [W12 ][W13 ][W14 ][W15 ]   ← C 行 48~63
+
+每一格代表 32 个线程共同负责的 16×16 输出块
+```
 
 ```cuda
+#include <cuda_fp16.h>
 #include <mma.h>
 using namespace nvcuda;
 
@@ -1253,48 +1340,364 @@ __global__ void hgemm_wmma_v7(int M, int N, int K,
     int warpN = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // 块列号
     int warpM = blockIdx.y * blockDim.y + threadIdx.y;         // 块行号
 
+    // grid 向上取整会产生多余 Warp；判断在整个 Warp 内一致
+    if (warpM * 16 >= M || warpN * 16 >= N) return;
+
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> aFrag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bFrag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> cFrag;
     wmma::fill_fragment(cFrag, 0.0f);
 
     for (int k = 0; k < K; k += 16) {
-        // 全 Warp 协作加载 A、B 的 16×16 块（第二个参数是行跨度）
+        // 全 Warp 协作加载 A、B 的 16×16 块（第三个参数是行跨度）
         wmma::load_matrix_sync(aFrag, A + warpM * 16 * K + k, K);
         wmma::load_matrix_sync(bFrag, B + k * N + warpN * 16, N);
-        // 一条 mma：16×16×16 = 4096 次乘加
+        // 一次 Warp 级逻辑操作：16×16×16 = 4096 次乘加
         wmma::mma_sync(cFrag, aFrag, bFrag, cFrag);
     }
 
     wmma::store_matrix_sync(C + warpM * 16 * N + warpN * 16, cFrag,
                             N, wmma::mem_row_major);
 }
+
+// 每 Block 512 线程 = 16 个 Warp，覆盖 C 的 64×64 区域
+dim3 block(128, 4);
+dim3 grid((N + 63) / 64, (M + 63) / 64);
+hgemm_wmma_v7<<<grid, block>>>(M, N, K, dA, dB, dC);
 ```
 
-注意三个与 CUDA Core 编程的本质差异：
+再按 2.6 节的习惯，抓住 Warp 0，固定 k=0 看地址：它的 32 个线程代入后都得到 `warpM=warpN=0`，传给 A 加载的都是 `A`，传给 B 加载的都是 `B`。这次不需要让相邻线程手工提供相邻地址——**WMMA 接收的是整个子块的起点，块内的协作加载由接口完成**。若额外给指针加上 `laneId`，反而破坏了全 Warp 参数一致的要求。
 
-1. **粒度上移**：编程单位从 Thread 变成 Warp，`*_sync` 后缀提醒这些调用必须由整个 Warp 一致执行；
-2. **混合精度**：输入 half、累加 float 是标准配置——K 很大时 fp16 累加会损失精度，fp32 累加器是精度保障；
-3. **数据布局不透明**：fragment 内部的数据-线程映射由架构决定，不能对 fragment 逐元素索引（除了 `fill_fragment` 这类统一操作）。
+几个实现细节：
 
-### 11.4 优化思路的完全复现
+- **累加器跨 K 循环保留**：`fill_fragment` 在循环外，`mma_sync` 每轮原地更新 `cFrag`，直到最后才写回。这与 V4 的 `acc` 生命周期完全相同。
+- **整 Warp 判断边界**：M=N=80 时，grid 向上取整会覆盖 128×128，多出来的完整 Warp tile 必须退出。判断只依赖 `warpM/warpN`，所以同一 Warp 要么全进、要么全退。这里没有 Block 栅栏；改为跨 Warp 协作后，需重新安排边界和同步。
+- **矩阵加载有对齐要求**：load/store 起始指针须 32 字节对齐；half 的 `ldm` 是 8 的倍数，float 的 `ldm` 是 4 的倍数。`cudaMalloc` 的基址配上本例的 16 元素分块满足这些条件，实际使用时也要检查子块偏移。
 
-这个最小实现相当于 Tensor Core 世界的 "V0"——每次 `load_matrix_sync` 都直接打到全局内存，数据零复用。**前十章的所有优化在这里原样重演一遍**：
+若维度不是 16 的倍数，边缘就只剩半块。WMMA 没有逐元素 mask，此时可先用普通线程把有效输入搬入对齐的共享内存 tile，越界补零，再做完整块乘法；输出也先写到共享内存，再按有效坐标写回。配套 `code/hgemm_wmma.cu` 实现的是上面的整块版本。
 
-| CUDA Core 版本 | Tensor Core 对应物 |
-|---|---|
-| V2 共享内存分块 | Block 内多 Warp 共享 As/Bs，`load_matrix_sync` 改从共享内存读 |
-| V4 二维 Thread Tiling | Warp Tiling：每 Warp 负责多个 16×16 块（如 64×64） |
-| V5 向量化 + 布局重排 | smem swizzle 布局消除 `ldmatrix` 的 Bank Conflict |
-| V6 双缓冲 | `cp.async` 多级流水 / Hopper TMA + `wgmma` |
+### 11.4 瓶颈分析：算得快了，数据跟得上吗？
 
-这正是 CUTLASS 的组织方式：它把上述每一层分块抽象成可组合的 C++ 模板组件。理解了 V0~V7，就能读懂 CUTLASS 的架构图。
+这个版本已经用上 Tensor Core，却还没有把 V2~V6 建立的数据流搬过来。看上面的 Warp 布局就能发现问题：**W0~W3 计算同一组输出行，需要的 A 子块完全相同，却各自从全局内存加载了一遍**；W0、W4、W8、W12 对 B 也有同样的重复读取。
+
+先按 2.8 节的方法算一笔账。每个 Warp 在一轮 K 段中加载两个 16×16 的 half 子块，完成一次 16×16×16 矩阵乘加：
+
+```
+计算量 = 2 × 16 × 16 × 16 = 8192 FLOP
+输入量 = (16×16 + 16×16) × 2 B = 1024 B
+AI     = 8 FLOP/Byte
+```
+
+这里忽略 C 写回与缓存效果，只计算程序请求的输入量。8 FLOP/Byte 已经高于 V0，因为**一个小矩阵乘内部就有复用**：每个 A 元素参与 16 个输出，每个 B 元素也参与 16 个输出。但复用到这个 16×16 块就停了，多个 Warp 之间仍靠缓存碰运气。
+
+再看 Roofline：Tensor Core 抬高了算力屋顶，显存带宽却没有因为换了一条计算路径而增加。要跑满更高的算力，每个搬进来的字节就必须支撑更多计算——**计算越快，数据复用越重要**。
+
+于是问题回到了前文：跨 Warp 重复读取，就在共享内存建立复用；共享内存读取仍多，就让寄存器中的片段多用几次；加载和计算仍串行，就再搭流水线。下面沿这条熟悉的路线走一遍。
+
+### 11.5 优化思路：把 V2~V6 的复用层次重新建立起来
+
+#### 11.5.1 Block Tiling：同一份 A/B，供多个 Warp 使用
+
+解法与 V2 相同：让 Block 协作把 A/B 子块搬进共享内存，Warp 再从共享内存加载 fragment。沿用前文的 BM/BN/BK 记号，这次取 **BM=BN=128、BK=32**：
+
+```
+每轮 K 段：
+  ① 普通线程协作搬入 As[128][32] 与 Bs[32][128]，保持全局访存合并
+  ② __syncthreads()，等全部输入到齐
+  ③ 各 Warp 从 As/Bs 加载 fragment，执行矩阵乘，累加到自己的输出块
+  ④ __syncthreads()，等全部 Warp 用完，再覆盖 As/Bs
+```
+
+注意角色分工与 6.6 节完全一致：**搬运按线程分工，计算按 Warp 分工，中间用共享内存衔接**。WMMA 的 `_sync` 只覆盖其 Warp 操作，不能替代这里两次 Block 级同步。
+
+再算同一笔账：
+
+```
+每轮输入 = (128×32 + 32×128) × 2 B = 16 KB
+每轮计算 = 2 × 128 × 128 × 32 = 1,048,576 FLOP
+输入侧 AI = 1,048,576 / 16,384 = 64 FLOP/Byte    ← 朴素 WMMA 的 8 倍
+```
+
+与前文资源账一致，这里的 KB 按 1024 字节计。一般地，输入每元素 s 字节时，`AI = 2·BM·BN / [s·(BM+BN)]`。BK 在分子分母中消掉了——它决定每轮搬多少、同步多频繁、共享内存占多少，**BM/BN 才决定输入复用程度**。这正是 7.2 节已经出现过的结论。
+
+现在全局内存读取少了，但若每个 16×16 输出块仍独立加载两个 fragment，shared→register 这一级还会反复读取相同数据。下一步自然是再分一次块。
+
+#### 11.5.2 Warp Tiling：把"标量外积"换成"片段外积"
+
+V4 让每个线程算多个输出，以复用寄存器中的 A/B；这里让**每个 Warp 算多个 16×16 块，以复用已经加载的 fragment**。
+
+一个具体分法：用 8 个 Warp 排成 4 行 × 2 列，每个 Warp 负责 **32×64** 的输出，正好拼成前一节的 128×128 Block Tile。每个 Warp 再把自己的输出分为 **2 行 × 4 列**的 WMMA 子块：
+
+```
+                          B fragments
+                   b[0]   b[1]   b[2]   b[3]
+                 ┌──────┬──────┬──────┬──────┐
+A fragments a[0] │c[0,0]│c[0,1]│c[0,2]│c[0,3]│  ← a[0] 横向复用 4 次
+                 ├──────┼──────┼──────┼──────┤
+            a[1] │c[1,0]│c[1,1]│c[1,2]│c[1,3]│  ← a[1] 横向复用 4 次
+                 └──────┴──────┴──────┴──────┘
+                    ↑ 每个 b[j] 纵向复用 2 次
+
+每一格：一个 16×16 累加器块；整张表：同一个 Warp 负责的 32×64 输出
+```
+
+下面是计算阶段的核心片段。`acc[2][4]` 在整个 K 主循环之前清零，直到循环结束才写回；`warpRow/warpCol` 为本 Warp 输出块在 Block 内的起点。As/Bs 采用行主序，`LDA_S/LDB_S` 为它们包含 padding 在内的实际行跨度：
+
+```cuda
+using AFrag = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
+using BFrag = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+using CFrag = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+CFrag acc[2][4];                  // 在完整 K 主循环前声明并清零
+for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 4; ++j)
+        wmma::fill_fragment(acc[i][j], 0.0f);
+
+int warpId = threadIdx.x / 32;    // 一维 Block，8 个 Warp
+int warpRow = (warpId / 2) * 32;
+int warpCol = (warpId % 2) * 64;
+
+// 以下位于每轮 As/Bs 装载与同步之后，BK=32 包含两个 16 长度的小段
+for (int kk = 0; kk < BK; kk += 16) {
+    AFrag a[2];
+    BFrag b[4];
+    // ① 加载 2 个 A 片段、4 个 B 片段
+    for (int i = 0; i < 2; ++i)
+        wmma::load_matrix_sync(a[i], As + (warpRow + i*16)*LDA_S + kk, LDA_S);
+    for (int j = 0; j < 4; ++j)
+        wmma::load_matrix_sync(b[j], Bs + kk*LDB_S + warpCol + j*16, LDB_S);
+    // ② 交叉组合，完成 8 个输出块的累加
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j)
+            wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+}
+```
+
+用 2.10 节"每次计算配几次读取"的视角再看一遍，只是这次的计数单位换成了矩阵片段：
+
+| 完成 8 次 WMMA | 每块独立加载 | Warp 内片段复用 |
+|----------------|--------------|-----------------|
+| A fragment 加载 | 8 次 | **2 次** |
+| B fragment 加载 | 8 次 | **4 次** |
+| 总加载 / WMMA | 16/8 = 2 | **6/8 = 0.75** |
+
+这就是第 8 章外积图的放大版：**每个标量换成一个小矩阵块，"先读入、再交叉复用"的思路完全相同**。表中计的是逻辑 fragment 加载次数，实际 SASS 条数还要看目标架构。
+
+代价也相同：32×64 = 2048 个 fp32 累加值，摊到 32 个线程平均每人 64 个，还要加输入 fragments 和地址状态。Warp Tile 过大，就会像 V4 一样遇到寄存器压力、占用率下降甚至 spill——**高复用仍然要用片上资源来换**。
+
+#### 11.5.3 布局重排：让共享内存适合矩阵读取
+
+加载次数降下来了，还要检查一次加载是否高效。V5 已经说明：**数据摆放的方向，要配合计算时取数的方向**。WMMA 同样会受到共享内存 Bank Conflict 的影响，只是加载不再由我们手写的标量下标直接决定。
+
+一个容易理解的办法是 padding/skew（给相邻行留出额外间隔）。NVIDIA 的 `cudaTensorCoreGemm` 示例在共享内存的行跨度中增加 `SKEW_HALF=16`，即 16 个 half：相邻行的 Bank 起点被错开，又保留 32 字节对齐。加载时把包含这段空隙的实际跨度传给 `load_matrix_sync`。这与 9.4 节提出的 padding 是同一种思路，具体间隔仍需结合布局测量。
+
+进一步优化时，CUTLASS 常使用 **swizzle（地址重排）**，把逻辑相邻的矩阵数据按适合 Bank 访问的方式重新布置，再配合 `ldmatrix`（共享内存矩阵加载指令）和更底层的 PTX `mma.sync` 使用。这里的关键是**存储布局与加载方式成对设计**：普通 WMMA 的行/列主序加固定步长不能表达任意 swizzle，不能只改 As/Bs 的地址排列而保留原来的加载代码。
+
+> 对照官方示例时还要注意：它的 B 用列主序，本文 B 用行主序。两者都能做矩阵乘，但地址公式、行列跨度与 shared 布局必须一起调整。
+
+#### 11.5.4 双缓冲：把等待移出计算的关键路径
+
+到这里，空间上的复用已经建立起来，时间上的问题却还在：11.5.1 节每轮仍然是"搬入 → 同步 → 计算 → 同步"。V6 的双缓冲再次派上用场，并且可以同时用在两层：
+
+| 流水层次 | 正在做什么 | 同时提前做什么 | 多占用的资源 |
+|----------|------------|----------------|--------------|
+| global→shared | 计算当前 As/Bs 子块 | 搬入后续 K 段到另一份 As/Bs | 共享内存缓冲 |
+| shared→register | 用当前 fragments 做 MMA | 加载后续 fragments | 寄存器缓冲 |
+
+Ampere 起的 `cp.async` 能直接把 global 数据异步送入 shared，省去 V6 中 `ta/tb` 这样的中转寄存器。程序先发起拷贝，继续计算，在真正使用下一份缓冲前等待拷贝完成；多个 Warp 共用缓冲时，还要安排消费者之间的同步。
+
+于是 V2~V6 的主线在 Tensor Core 上完整重现：
+
+```
+重复读 global → Block Tiling → 重复读 shared → Warp Tiling
+             → 改善加载布局 → 双缓冲，重叠搬运与矩阵计算
+```
+
+但还有一个与 2.9 节相关的问题：**即使拷贝已经异步，线程仍要计算地址、发出许多小拷贝指令**。当 Tensor Core 算得足够快，这些"准备数据"的工作也会成为负担。Hopper 的 TMA，正是沿这条搬运路径继续优化。
+
+### 11.6 TMA：让硬件接手整块数据的搬运
+
+#### 11.6.1 优化思路：从"每线程搬一份"到"一次提交整块"
+
+回看 V6 的搬运路径，每个线程都要算出地址、发出 LDG、暂存在寄存器里，再写入 shared。Ampere 的 `cp.async` 省去了中转寄存器，但单条线程指令仍搬 4/8/16 字节，铺满一个大 tile 需要许多这样的小拷贝。
+
+Hopper（计算能力 9.0）引入 **TMA（Tensor Memory Accelerator，张量内存加速器）**，进一步把搬运提高到张量块的粒度：程序告诉硬件"从 A 的哪个位置搬一个多大的矩形，放到哪份 shared 缓冲"，硬件接手这批地址计算与数据传输。
+
+```
+V6：       global ──LDG──► 寄存器 tmp ──STS──► shared
+cp.async： global ───────小粒度异步拷贝────────► shared
+TMA：      global ───────整块异步搬运──────────► shared
+                           ↑
+               一个线程就可以提交整个 tile 的搬运请求
+```
+
+沿用上一节的 BM=BN=128、BK=32：A/B 每轮共 16 KB，若拆成 16 字节的小拷贝，需要覆盖 1024 份数据；TMA 可用 A、B 两个整块请求表达这次搬运。**搬运的字节数没变，变少的是 SM 上组织搬运的工作。** 这是请求粒度的差别，并不代表耗时按请求数量同比缩减。
+
+于是两种专用硬件的分工很清楚：**Tensor Core 加速"算这块矩阵"，TMA 加速"把这块矩阵送过来"**。相对 V6，TMA 可以减少中转寄存器与搬运指令；相对已经绕过寄存器的 `cp.async`，进一步的收益主要来自整块地址处理和请求提交。
+
+#### 11.6.2 搬什么、从哪搬：用描述符代替逐元素地址
+
+硬件要接手地址计算，就必须知道矩阵怎样存放。这个信息放在 **Tensor Map（张量描述符）** 中：它记录基址、元素类型、各维大小、存储跨度，以及每次搬运的子块形状。常见做法是在 host 用 `cuTensorMapEncodeTiled` 创建 `CUtensorMap`，再作为 `const __grid_constant__` 参数传给 kernel。
+
+还是用本文的两个行主序矩阵。设当前 Block 输出起点为 `(m0,n0)`，本轮 K 起点为 t：
+
+```
+要搬的 A：从 A[m0][t] 开始，取 BM 行、BK 列 → As[BM][BK]
+要搬的 B：从 B[t][n0] 开始，取 BK 行、BN 列 → Bs[BK][BN]
+```
+
+描述符中**变化最快的维度写在前面**，所以对应关系是：
+
+| 描述内容 | A | B |
+|----------|---|---|
+| 全局尺寸 `globalDim` | `{K, M}` | `{N, K}` |
+| 行跨度 `globalStrides`（字节） | `{K * sizeof(half)}` | `{N * sizeof(half)}` |
+| 搬运形状 `boxDim` | `{BK, BM}` | `{BN, BK}` |
+| 本轮起始坐标（元素） | `{t, m0}` | `{n0, t}` |
+
+表中假定紧密存储、元素步进为 1，先不加 swizzle。若有行尾 padding，尺寸仍填逻辑矩阵大小，跨度则填真实的字节距离。与 11.2 节 WMMA 的 `ldm` 对照记忆：**WMMA 的跨度按元素计，Tensor Map 的全局跨度按字节计**。
+
+描述符准备好后，每轮只需换起始坐标和目标缓冲，不必让每个线程重新计算一批元素地址。TMA 的张量加载还能根据全局尺寸对越界输入补零，适合处理末尾 K 段；布局与对齐条件仍要满足。
+
+> 实现细节：Hopper 常规多维 TMA 搬运要求 global 基址 16 字节对齐、外层字节跨度为 16 的倍数、shared 目标基址 128 字节对齐，搬运字节数为 16 的倍数；后面用到的 barrier 需 8 字节对齐。Swizzle 等模式还有附加约束。连续一维 `cp.async.bulk` 可直接用指针和长度，shared 对齐要求为 16 字节；本节的二维搬运使用 `cp.async.bulk.tensor`，两者不要混用规则。
+
+#### 11.6.3 同步："线程到了"与"数据到了"是两件事
+
+数据交给 TMA 搬运后，线程可以继续往下执行。这也带来一个新问题：**线程走到了 `__syncthreads()`，并不代表外面的搬运已经完成**。读取 As/Bs 前，还得等 TMA 发来"数据已到齐"的通知。
+
+TMA 的 global→shared 搬运用 **mbarrier（共享内存中的异步屏障）**跟踪完成。可以把它看成一张收货单：除了记录参与者是否到达，还记录"本轮应该收到多少字节"。例如 A、B 两次搬运共用一个屏障时，登记总共 16 KB；所需参与者到达、16 KB 数据也全部到齐后，这一轮才完成，计算方才可以读取。
+
+这只是前文两次同步中的第一次。6.3 节的另一个条件——"没吃完不许撤"——仍然存在：**计算方还没用完 As/Bs，搬运方就不能覆盖它们**。因此每份缓冲需要两种通知：
+
+```
+空闲（empty） → 提交 TMA → 搬运中 → 数据就绪（full）
+     ↑                                  │
+     └──────── 全部计算方用完 ← 开始计算 ─┘
+
+full：告诉计算方，数据到了，可以读
+empty：告诉搬运方，旧数据用完了，可以覆盖
+```
+
+在多级流水线中，每一份 As/Bs 缓冲称为一个 **stage**。stage 会循环使用，还要记录它当前处于哪一轮（**phase**），避免把"上一次搬完"误当作"这一次搬完"。这只是 V6 的 `cur/next` 管理扩展到了多份缓冲和异步通知。
+
+两个实现上的细节也由此而来：预期字节数要按搬运总量登记，不能让每个线程各加一遍；普通线程初始化屏障或写 shared 后，要按接口要求通过 **async proxy fence** 建立对异步引擎的可见性。CUDA 的 `cuda::barrier` 和 CUTLASS 的 pipeline 提供封装，使用时应确认哪些计数、同步已由它们完成。
+
+#### 11.6.4 核心流程：搬运与计算各自向前推进
+
+有了整块搬运与两种通知，就可以把 V6 的流水线改造成下面的时间线：
+
+```
+时间 →
+TMA：       [搬 T0] [搬 T1] [搬 T2] [搬 T3]
+矩阵计算：          [算 T0] [算 T1] [算 T2] [算 T3]
+                 ↑ 先装入首块，随后搬下一块与算当前块重叠
+```
+
+进一步，可以让一部分 Warp 专门组织搬运，另一部分 Warp 专门计算，称为 **Warp Specialization（Warp 专职分工）**。前者是生产者，负责找空缓冲、推进坐标、提交 TMA；后者是消费者，等数据就绪后做矩阵乘。TMA 请求只需由生产者中选出的一个线程提交，其他计算线程不必一起执行这条搬运指令。
+
+下面用伪代码写出两边的主循环。初始时所有缓冲可写；`q` 是 K 子块编号，`s=q%S` 是它使用的缓冲编号：
+
+```text
+生产者：                              消费者：
+                                      累加器清零
+for q = 0 .. K子块数-1:               for q = 0 .. K子块数-1:
+    s = q % S                             s = q % S
+    等本轮 empty[s]，取得写入权              等本轮 full[s]，确认数据可读
+    登记本轮 A/B 总字节数与参与者到达         用 As[s]/Bs[s] 做矩阵乘累加
+    提交 A → As[s] 的 TMA                  确认所有计算方已用完这份缓冲
+    提交 B → Bs[s] 的 TMA                  通知 empty[s]，允许再次写入
+    推进 stage/phase                      推进 stage/phase
+                                      等全部计算完成，写回输出
+
+TMA 在搬运完成时更新 full[s]；生产者提交请求后即可准备后续子块
+```
+
+这套循环把同步集中在了缓冲的交接处。CUTLASS 的 `PipelineTmaAsync` 正是对它的封装：`producer_acquire` 取得空缓冲，`consumer_wait` 等待数据，`consumer_release` 归还缓冲，TMA 完成则负责更新相应的就绪屏障。上面的伪代码展示了交接顺序；落到实际接口时，还需配套初始化屏障、设置参与计数并执行必要的 fence。
+
+**再向前一步：计算也异步化。** Hopper 提供 **WGMMA（Warpgroup 级矩阵乘加）**，由 4 个 Warp、128 个线程共同发起异步矩阵运算。它的 B 来自 shared，A 可来自 shared 或寄存器；常见 shared/shared 路径让硬件直接按描述符读取 As/Bs，结果仍累加在各线程的寄存器中。
+
+这使 TMA 与矩阵计算更容易组成流水线，但也让"用完缓冲"的判断更加重要：**WGMMA 已经发射，不等于它已经读完 shared**。程序需要按 WGMMA 的 fence、commit-group、wait-group 协议确认相应计算完成，才能释放所引用的 stage。TMA 的完成通知管"搬到了没有"，WGMMA 的完成等待管"算完了没有"，两者各管一段。
+
+> TMA 也可以向 WMMA 提供数据，专职生产者同样不是必需条件；这里展示的是 Hopper 常用的高性能组织方式。WGMMA 通常使用 `sm_90a` 编译目标，其 shared 描述符与 TMA 的全局 Tensor Map 是不同对象，但两边必须理解同一份 shared 布局。
+
+#### 11.6.5 收益与代价：省下组织搬运的工作，付出缓冲与同步
+
+回到本节最初的问题，TMA 的收益可以归纳为三点：
+
+1. **减少搬运指令与地址计算**：一个整块请求替代线程组织的一批小拷贝，给 SM 留出更多计算和调度余地；
+2. **减轻中转寄存器压力**：相对 V6 的 global→register→shared 路径，数据可以直接落到 shared；
+3. **使流水线分工更清楚**：生产者准备后续块，消费者计算当前块，只在依赖真正发生时等待。
+
+代价仍用 2.7 节的资源账衡量。上一节每轮 A/B 共 16 KB，开 S 份缓冲：
+
+```
+共享内存输入缓冲 = S × (BM×BK + BK×BN) × sizeof(half)
+                = S × 16 KB
+S=2：32 KB；S=3：48 KB    ← 还没算 padding、屏障和输出暂存
+```
+
+缓冲越多，可以预取越远，但可驻留的 Block 也可能越少；K 很短时，流水线尚未充分展开，计算就结束了。理想稳态中，每段时间从 `T搬运 + T计算` 趋近于 `max(T搬运, T计算)`，实际收益还要扣除同步、预热与排空成本。**TMA 不改变矩阵的计算量，也不自动增加数据复用**；如果瓶颈已经是 HBM 带宽，就还要回到 BM/BN 与共享策略上想办法。
+
+Hopper 对这条复用主线还提供了两种配合手段：
+
+- **搬入时按 swizzle 布局摆放**：TMA 可按受支持的 swizzle 写入 shared，减少后续矩阵读取的 Bank Conflict；计算侧的加载逻辑或 WGMMA 描述符必须与之匹配，不能把任意重排后的数据直接交给普通 WMMA load。
+- **Cluster 内 multicast（多播）**：6.5 节中，同一输出块行的多个 Block 需要相同的 A。若把它们组织为一个 Thread Block Cluster，可将同一输入 tile 搬到多个 Block 各自的 shared，减少重复请求；相应地要协调目标缓冲、屏障与 Cluster 调度。它把复用向 Block 外再推进了一层，但不保证 HBM 流量严格按接收者数量缩减。
+
+因此实践时应逐步测量：先保证单份缓冲搬运正确，再增加 stage 观察等待是否减少，然后尝试 Warp 分工或 multicast。Nsight Compute 中的 Tensor 管线利用率、内存吞吐、等待停顿以及 shared/寄存器占用，分别对应这几笔收益与代价。
+
+### 11.7 从计算主循环到完整 GEMM
+
+把本章的数据流与第 8 章的三级分块图放在一起看，主线其实没有变：
+
+```
+全局内存 ──Block 协作 / cp.async / TMA──► 共享内存中的 A/B 子块
+                                                │
+                                    Warp / Warpgroup 矩阵计算
+                                                │
+                                                ▼
+                                     寄存器中的 C 累加器
+                                                │ K 全部算完
+                                                ▼
+                                          后处理并写回
+```
+
+最后这一步称为 **Epilogue（收尾阶段）**。此前为聚焦乘法，本文取 α=1、β=0；完整 GEMM 还要做 `α·acc + β·C`，实际模型中常接 bias、激活和类型转换。把它们融合在写回前，就能省下一次额外 kernel 以及中间结果的读写。
+
+这时又会遇到 11.2 节的 fragment 布局问题。对所有元素做相同的缩放，不需要知道坐标，可以让整个 Warp 都执行：
+
+```cuda
+for (int i = 0; i < cFrag.num_elements; ++i)
+    cFrag.x[i] *= alpha;           // 每线程处理自己的部分，alpha 在 Warp 内相同
+```
+
+若要按列加不同 bias，或只写回边缘的有效区域，就需要明确的行列坐标。一个直接方案是先用 `store_matrix_sync` 把结果写入共享内存，再由线程按已知布局处理并合并写回——**计算分工与写回分工也可以解耦**，这与前文"搬运分工与计算分工解耦"是同一种组织方法。
+
+Hopper 还可用 TMA 从 shared 整块写回 global。不过这个方向使用 bulk async-group 跟踪完成，与输入搬运的 mbarrier 不同；普通线程写 shared 后要建立对异步引擎的可见性，复用输出缓冲前要等 TMA 读完，后续若要消费 global 结果则需相应的写入完成与可见性保证。
+
+至此，优化的三个层次重新合在一起：**分块决定复用多少，布局决定搬得是否高效，流水线决定搬运能否被计算掩盖**。Tensor Core 和 TMA 分别加强计算端与搬运端，组织原则仍是前十章那一套。CUTLASS 将这些层次封装成可组合的组件；小 M/N、大 K 等形状还需按并行度选择 tile 或 Split-K，无法靠一个大 tile 覆盖所有情况。
+
+有了主循环与写回，还需要回答最后两个工程问题：算得是否正确，放进框架后是否真的更快？第 12 章转向这部分。对本章尤其要记住：正确性参考使用 half 舍入后的输入；性能参考采用相同输入、累加和输出精度，并说明是否计入精度转换、padding、描述符建立与后处理。
+
+### 11.8 官方资料与代码对照
+
+继续阅读官方实现时，可以按本章的推进顺序对照。仓库的 `code/hgemm_wmma.cu` 对应 11.3 节的最小版本；后续分块与 TMA 流水线可接着阅读以下资料：
+
+1. [CUDA C++ Programming Guide §7.24：Warp Matrix Functions](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#warp-matrix-functions)：WMMA、fragment、全 Warp 参与、对齐/leading dimension、类型与形状、统一元素操作。
+2. [CUTLASS：Efficient GEMM in CUDA](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html)：层次化分块、两级流水线、epilogue、Split-K、Hopper Warp Specialization。
+3. [CUDA Samples v12.5：cudaTensorCoreGemm](https://github.com/NVIDIA/cuda-samples/blob/v12.5/Samples/3_CUDA_Features/cudaTensorCoreGemm/cudaTensorCoreGemm.cu)：对照 `simple_wmma_gemm` 与 `compute_gemm`，理解 shared 复用、每 Warp 多块与 `SKEW_HALF`。
+4. [Hopper Tuning Guide §1.4.1.2：Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator)：TMA 的搬运能力、减轻寄存器/指令负担与 Warp 分工。
+5. [CUDA C++ Programming Guide §7.29：TMA Asynchronous Data Copies](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#asynchronous-data-copies-using-the-tensor-memory-accelerator-tma)：1D/多维拷贝、Tensor Map 创建、完成机制、对齐表、边界与 proxy fence。
+6. [CuTe：TMA Tensors](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/0z_tma_tensors.html)：描述符、TMA 坐标，以及它们与普通指针式 tensor 的区别。
+7. [CUTLASS：Synchronization Primitives](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/pipeline.html)：生产者取得/提交、消费者等待/释放，以及异步 pipeline 抽象。
+8. [CUTLASS：Warpgroup MMA Programming Guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/mma/wgmma_programming.html)：Hopper 的 128 线程协作、shared 操作数、寄存器累加器与 WGMMA 执行协议；代码采用 CuTe DSL，适合理解数据流。
+
+其中 CUDA 编程指南固定为 12.6.3，示例固定为 CUDA Samples v12.5，便于对照章节和代码；CUTLASS 使用在线文档，具体接口需与采用的库版本对应。
 
 ---
 
 ## 第 12 章 工程化：PyTorch 扩展与 cuBLAS 对比
 
-写出高性能 kernel 只是一半，另一半是把它接入实际框架并正确地度量。本章给出一个完整可编译运行的 PyTorch CUDA 扩展，并讨论正确性验证与性能测量中的常见陷阱。
+前面已经走完了从标量 FMA、分块复用到 Tensor Core 与异步搬运的优化路线。接下来要把 kernel 接入实际框架，并确认这些优化在真实调用中是否有效。本章以 fp32 的 V5 为例，给出 PyTorch CUDA 扩展的接入方式，再讨论正确性验证与性能测量中的常见陷阱；V7 接入时还需按上一章的约定处理输入精度。
 
 ### 12.1 完整的 PyTorch 扩展
 
@@ -1430,12 +1833,12 @@ print(f"{t:.3f} ms, {tflops:.1f} TFLOPS   (cuBLAS: {bench(lambda: A @ B):.3f} ms
 | 指标 | V0 | V1 | V2 | V3 | V4 | V5 | V6 | V7(fp16) |
 |------|----|----|----|----|----|----|----|----|
 | 全局访存合并 | 否 | 是 | 是 | 是 | 是 | 是 | 是 | 是 |
-| 实际 AI (FLOP/B) | 0.25 | 0.25 | 8 | ~32 | ~64 | ~64 | ~64 | ~64 |
-| LDS / FMA | — | — | 2 | ~1.1 | 0.25 | 0.25(向量) | 0.25 | ldmatrix |
+| 输入侧 AI 估算 (FLOP/B，不计缓存与写回) | 0.25 | 0.25 | 8 | 16 | 32 | 32 | 32 | 8（朴素版） |
+| LDS / FMA | — | — | 2 | ~1.1 | 0.25 | 0.25(向量) | 0.25 | 不直接适用，需分析矩阵加载/MMA |
 | 每线程输出数 | 1 | 1 | 1 | 8 | 64 | 64 | 64 | Warp 级 |
-| 相对 cuBLAS(fp32) | ~1% | ~8% | ~15% | ~35% | ~55% | ~70% | ~85% | >100%* |
+| 相对 cuBLAS(fp32) | ~1% | ~8% | ~15% | ~35% | ~55% | ~70% | ~85% | 跨精度，单独测量* |
 
-> \* V7 与 fp32 cuBLAS 比较是跨精度的，仅示意 Tensor Core 的吞吐量级；与 fp16 cuBLAS 相比，朴素 WMMA 实现仍需第 11.4 节的全套优化才能接近。具体数字随架构（占用率、频率、缓存）浮动，表中比值取多个公开复现实验的典型量级，请以自己机器上的实测为准。
+> \* V7 的 8 FLOP/B 对应 11.3 节的最小实现；11.5 节建立 128×128 Block Tile 复用后，输入侧才达到 64 FLOP/B。性能应与相同输入、累加和输出精度的 cuBLAS 配置比较，各版本的量级示意请以自己机器上的实测为准。
 
 ### 13.3 通用优化方法论
 
@@ -1451,8 +1854,10 @@ GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规
 |------|------|
 | 理解 GPU 存储层次 | 精读 V0 → V2 |
 | 理解现代 GEMM kernel 结构 | 精读 V4 → V6（三级分块 + 双缓冲） |
+| 理解 WMMA 与 32 线程协作 | 第 11.2~11.3 节，再读官方 `cudaTensorCoreGemm` |
 | 进阶：Warp Tiling / swizzle / Split-K | siboehm 博客、CUTLASS 文档 |
-| 进阶：Tensor Core 深入 | `mma.sync` PTX、`ldmatrix`、CUTLASS CuTe |
+| 进阶：Tensor Core 深入 | 第 11.4~11.5 节、`mma.sync` PTX、`ldmatrix`、CUTLASS CuTe |
+| 进阶：Hopper TMA / WGMMA | 第 11.6 节，再读 CUTLASS Hopper Warp Specialization 与 pipeline 文档 |
 | 生产环境 | cuBLAS / cuBLASLt / CUTLASS，融合场景用 Triton 或手写 |
 
 ---
@@ -1462,7 +1867,7 @@ GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规
 | 概念 | 含义 | 相关章节 |
 |------|------|---------|
 | GEMM | 通用矩阵乘 C = αAB + βC，计算量 2MNK | 第 1 章 |
-| Warp | 32 个连续线程的硬件调度单元，锁步执行（SIMT） | 第 2 章 |
+| Warp | 32 个连续线程的 SIMT 执行组；线程通信仍需遵守显式同步规则 | 第 2、11 章 |
 | 合并访存 | Warp 内线程访问连续地址，合并为最少内存事务 | 第 2、4~5 章 |
 | Bank Conflict | Warp 内多线程访问共享内存同一 Bank 的不同地址被串行化 | 第 2、9 章 |
 | 四步分析法 | 拍扁地址 → 抓代表 Warp → 冻结时刻 → 看 threadIdx.x 系数，判定访存模式 | 第 2、4~5 章 |
@@ -1485,9 +1890,13 @@ GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规
 | float4 / LDG.128 | 16 字节向量访存，同等指令数 4 倍吞吐 | 第 9 章 |
 | smem 转置存储 | 让计算期的访问方向与存储方向一致，使 LDS 可向量化 | 第 9 章 |
 | 双缓冲 | 两份缓冲乒乓切换，加载与计算重叠 | 第 10 章 |
-| cp.async / TMA | Ampere/Hopper 的异步拷贝机制，双缓冲的硬件化 | 第 10~11 章 |
-| Tensor Core | 以小矩阵块为单位的乘加硬件，半精度吞吐 8~16 倍 | 第 11 章 |
-| WMMA / fragment | Warp 级矩阵乘 API；数据在 Warp 内的分布对程序员不透明 | 第 11 章 |
+| cp.async | Ampere 起支持的 global→shared 小粒度异步拷贝，可绕过中转寄存器 | 第 10~11 章 |
+| TMA / Tensor Map | Hopper 整块异步搬运机制 / 描述全局张量与搬运形状、布局的对象 | 第 11.6 节 |
+| mbarrier / phase | 跟踪线程到达与异步事务完成 / 区分循环缓冲的不同轮次 | 第 11.6 节 |
+| Warp Specialization | 不同 Warp 专职生产数据或消费数据，用流水线同步协作 | 第 11.6 节 |
+| WGMMA | Hopper 的 128 线程 Warpgroup 级异步矩阵乘加 | 第 11.6 节 |
+| Tensor Core | 矩阵乘加硬件，支持的精度、形状与吞吐随架构变化 | 第 11 章 |
+| WMMA / fragment | 32 线程集体矩阵乘 API / 矩阵块在各线程中的局部存储，坐标映射不透明 | 第 11 章 |
 | CUTLASS | NVIDIA 开源 GEMM 模板库，本文各级分块的组件化实现 | 第 11~12 章 |
 | Split-K | K 维切给多个 Block 并行、结果归约；小 M/N 大 K 时提高并行度 | 第 13 章 |
 | PYBIND11_MODULE | 把 C++/CUDA 函数导出为 Python 模块的最简方式 | 第 12 章 |
