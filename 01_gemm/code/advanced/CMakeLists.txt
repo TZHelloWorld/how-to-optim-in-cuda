@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.18)
+project(gemm_advanced LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+enable_testing()
+add_executable(schedule_test schedule_test.cpp)
+add_test(NAME schedule_test COMMAND schedule_test)
+
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    add_executable(gemm_advanced gemm_advanced.cu)
+    set_target_properties(gemm_advanced PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(gemm_advanced PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    option(GEMM_ENABLE_GPU_TESTS "Run GPU correctness suite under CTest" OFF)
+    if(GEMM_ENABLE_GPU_TESTS)
+        add_test(NAME gpu_correctness COMMAND gemm_advanced --check-suite)
+    endif()
+else()
+    message(STATUS "CUDA compiler not found: building CPU schedule checks only")
+endif()

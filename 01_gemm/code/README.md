@@ -2,7 +2,7 @@
 
 对应文档: [`../cuda_gemm_optimization_guide.md`](../cuda_gemm_optimization_guide.md)
 
-从文档中提取的可运行代码，覆盖 V0~V7 全部 8 个优化版本（SGEMM `C = A × B`，行主序）。
+从文档中提取的可运行代码，覆盖 V0~V7 全部 8 个优化版本（SGEMM `C = A × B`，行主序）。第 13 章的调度、预打包、融合、批处理与调用层示例放在 [`advanced/`](advanced/README.md)，支持带边界和独立行跨度的 fp32 GEMM。
 
 ## 目录结构
 
@@ -10,6 +10,13 @@
 code/
 ├── sgemm.cu                     # V0~V6 全部 fp32 kernel + 计时/CPU 校验驱动
 ├── hgemm_wmma.cu                # V7 Tensor Core / WMMA 半精度实现（第 11 章）
+├── advanced/                    # 第 13 章通用优化、完整驱动与检查（独立构建）
+│   ├── gemm_advanced.cu
+│   ├── kernels.cuh
+│   ├── schedule.h
+│   ├── schedule_test.cpp
+│   ├── CMakeLists.txt
+│   └── README.md
 ├── pytorch_extension/
 │   ├── gemm_kernel.cu           # PyTorch CUDA 扩展，封装 sgemm_v5（第 12 章）
 │   ├── setup.py
@@ -71,6 +78,26 @@ nvcc -O3 -arch=sm_70 hgemm_wmma.cu -o hgemm_wmma
 
 > `-arch=sm_70` 请按你的 GPU 计算能力调整。Tensor Core（WMMA）需 Volta（sm_70）及
 > 以上；V0~V6 只需 sm_60+。
+
+## 第 13 章：通用优化示例
+
+在 `code/` 目录执行，架构参数按目标 GPU 调整：
+
+```bash
+nvcc -std=c++17 -O3 -lineinfo -arch=sm_80 advanced/gemm_advanced.cu -o gemm_advanced
+./gemm_advanced --check-suite
+./gemm_advanced --demo core --m 129 --n 257 --k 65
+./gemm_advanced --demo split --m 64 --n 64 --k 4097 --split 16
+./gemm_advanced --demo streamk --m 64 --n 64 --k 4097 --workers 32
+./gemm_advanced --demo packed
+./gemm_advanced --demo fusion
+./gemm_advanced --demo batch
+./gemm_advanced --demo tune
+./gemm_advanced --demo graph --iters 100
+./gemm_advanced --demo cache
+```
+
+每项会核对 CPU 参考与输出 padding，再打印计时；默认 CPU 参考面向小规模教学验证。完整参数、计时口径、架构限制及无 GPU 的调度测试见 [`advanced/README.md`](advanced/README.md)。
 
 ## PyTorch 扩展
 
@@ -159,8 +186,9 @@ ncu --launch-count 1 -k sgemm_v4 ./sgemm 1024          # 只抓一次启动
 
 ## 说明
 
-- 所有 kernel 算法逻辑严格忠实于文档，仅补充了可编译运行所需的上下文：头文件、
+- V0~V7 的 kernel 算法逻辑对应前文章节，补充了可编译运行所需的上下文：头文件、
   `CUDA_CHECK` 宏、`main`、主机端矩阵初始化、kernel launch、CPU 参考 GEMM、
   cudaEvent 计时与 GFLOPS 计算。
 - CPU 参考实现即文档第 1 章的三重循环点积。
 - 矩阵默认取 1024×1024，CPU 校验约需数秒，规模适中。
+- `advanced/` 有独立的默认形状、检查集合与计时驱动；其中 Stream-K 为明确分离计算和归约的教学版本。

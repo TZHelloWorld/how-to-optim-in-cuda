@@ -1,6 +1,6 @@
 # CUDA GEMM（矩阵乘）算子优化指南
 
-> 本文以 SGEMM（单精度通用矩阵乘）为例，系统介绍 CUDA 上**计算受限（compute-bound）算子**的典型优化方法。GEMM 优化的目标是"跑满算力"，核心手段是**数据复用**——让每个从内存搬进来的字节参与尽可能多的计算。全文从最朴素的实现出发，沿着"分析数据流 → 定位复用不足的层次 → 在该层次建立分块"的主线，逐步演进出 8 个版本（V0~V7），从不足 cuBLAS 2% 的性能一路逼近硬件峰值，最后过渡到 Tensor Core 与工程实践。
+> 本文以 SGEMM（单精度通用矩阵乘）为例，系统介绍 CUDA 上**计算受限（compute-bound）算子**的典型优化方法。对于足够大的 GEMM，优化的目标是"跑满算力"，核心手段是**数据复用**——让每个从内存搬进来的字节参与尽可能多的计算。全文从最朴素的实现出发，沿着"分析数据流 → 定位复用不足的层次 → 在该层次建立分块"的主线，逐步演进出 8 个版本（V0~V7），再过渡到 Tensor Core、TMA 与工程实践，最后把视角扩展到不同矩阵形状、全 GPU 调度和完整工作负载的通用优化。
 >
 > 本文内容完全自包含：理解全文所需的 GPU 执行模型、内存层次、合并访存、Bank Conflict、占用率等基础概念，都在第 2 章从零讲起，无需先阅读其他资料。
 
@@ -20,7 +20,8 @@
 - [第 10 章 V6：双缓冲——用计算掩盖访存延迟](#第-10-章-v6双缓冲用计算掩盖访存延迟)
 - [第 11 章 V7：Tensor Core——WMMA 半精度矩阵乘](#第-11-章-v7tensor-corewmma-半精度矩阵乘)
 - [第 12 章 工程化：PyTorch 扩展与 cuBLAS 对比](#第-12-章-工程化pytorch-扩展与-cublas-对比)
-- [第 13 章 总结与实践建议](#第-13-章-总结与实践建议)
+- [第 13 章 进阶通用优化：从单个 Block 到完整工作负载](#第-13-章-进阶通用优化从单个-block-到完整工作负载)
+- [第 14 章 总结与实践建议](#第-14-章-总结与实践建议)
 - [附录：关键概念速查](#附录关键概念速查)
 
 ---
@@ -316,7 +317,7 @@ GEMM 的理论算术强度（按 1.2 节的最少访存量计算）：
 AI = 2MNK / 4(MK + KN + MN)     （M=N=K 时 ≈ K/6）
 ```
 
-K=4096 时 AI ≈ 683 FLOP/Byte，远超平衡点——**GEMM 天生是 compute-bound 算子，理论上限是算力峰值**。
+M=N=K=4096 时 AI ≈ 683 FLOP/Byte，远超上述平衡点——**这个大方阵 GEMM 具备成为 compute-bound 的条件，理论上限是算力峰值**。小矩阵或极度瘦长的矩阵未必如此；第 13 章会把矩阵形状和全 GPU 并行度一起纳入分析。
 
 **但朴素实现是 memory-bound 的。** 上面的 AI 用的是"理论最少访存量"。V0 每个线程独立地从全局内存读 2K 个数做 K 次乘加，谁也不复用谁的数据，**实际**访存量是 2·M·N·K 个 float：
 
@@ -749,7 +750,7 @@ A 行32..63 │ Block(0,1) │ Block(1,1)│
 
 - **L2 缓存（自动，全 GPU 共享）**：所有 SM 的全局内存访问都经过 L2（几十 MB）。Block(0,0) 读过 A 的第 0 行后，数据会留在 L2 中；稍后 Block(1,0) 再读时很可能直接命中 L2，不必真的到显存。这正是 2.8 节复用层次表中"全局内存 → L2：自动，不可控"一行的含义——有效，但命中与否取决于 Block 调度时机与 L2 置换策略，**程序员不能依赖它**；
 - **进阶手段**（了解即可）：
-  - **Block Swizzle**：重排 blockIdx 到 C 子块的映射，让"同时在跑"的 Block 集中在 C 的一个局部区域（它们所需的 A/B 行列高度重叠），人为提高 L2 命中率——cuBLAS / CUTLASS 都做了这件事；
+  - **Block Swizzle**：重排 blockIdx 到 C 子块的映射，让"同时在跑"的 Block 集中在 C 的一个局部区域（它们所需的 A/B 行列高度重叠），人为提高 L2 命中率——第 13.5 节将展开这笔复用账；
   - **Thread Block Cluster（Hopper，sm_90+）**：新硬件真正开了口子——同一 Cluster 内的 Block 保证同时调度到相邻 SM，可通过 **分布式共享内存（Distributed Shared Memory）** 直接读写彼此的 smem。这正是硬件对"跨 Block 复用"诉求的回应，但它是带严格约束的新特性，不是通用机制。
 
 一句话总结：**Block 内复用靠共享内存（显式、可控），Block 间复用靠 L2（隐式、尽力而为）**。6.4 节算出的 1/32 缩减，指的仅是前者。
@@ -1208,7 +1209,7 @@ __global__ void sgemm_v5(int M, int N, int K,
 
 ### 10.4 至此的性能位置
 
-V6 在多数架构上可达 cuBLAS SGEMM 的 **80%~90%**。剩余差距来自更精细的技巧：Warp Tiling（在 Block 与 Thread 之间再加一级 warp 级分块，优化寄存器缓存局部性与 Bank 访问模式）、swizzle 布局、K 维 Split-K 并行等——它们收益递减、复杂度陡增，工程上通常直接交给 CUTLASS。
+V6 在合适的大矩阵与参数配置下，可以接近 cuBLAS SGEMM 的性能。进一步优化包括 Warp Tiling（在 Block 与 Thread 之间再加一级 warp 级分块）、swizzle 布局，以及调整全 GPU 的任务划分。前两者将在第 11 章结合 Tensor Core 展开；小 M/N、大 K 等形状还可以通过 Split-K 增加并行任务，第 13 章再详细分析。
 
 而**数量级**的下一次跃迁来自硬件：Tensor Core。
 
@@ -1811,11 +1812,1380 @@ print(f"{t:.3f} ms, {tflops:.1f} TFLOPS   (cuBLAS: {bench(lambda: A @ B):.3f} ms
 
 手写 GEMM 的最大价值不是替代库，而是**具备读懂和修改 CUTLASS / FlashAttention 这类代码的能力**——它们的内核结构正是本文三级分块 + 双缓冲 + Tensor Core 的组合。
 
+不过，一个在 4096³ 方阵上很快的 kernel，换成瘦长矩阵、几十个小 GEMM 或一段带后处理的调用链，可能又慢下来。此时未必是内层乘加写得不好，而是任务划分和使用方式变了。下一章把视角从单个 Block 的主循环移到完整工作负载。
+
 ---
 
-## 第 13 章 总结与实践建议
+## 第 13 章 进阶通用优化：从单个 Block 到完整工作负载
 
-### 13.1 八个版本回顾
+V0~V7 主要回答：一个 Block 拿到一块矩阵后，怎样高效地搬、复用和计算？真实 GEMM 还要回答另外几件事：**这块矩阵切得合适吗，Block 数量够吗，多个 Block 能否复用缓存，前后处理是否抵消了计算收益？**
+
+本章沿这些问题继续优化。这里的"通用"指思路可以跨多种 GEMM 实现使用，并不表示每一招对所有形状都有效。下面仍按前文的方式，先找浪费发生在哪里，再讨论改法和代价。
+
+本章各算法小节直接结合 [`code/advanced/`](code/advanced/README.md) 的实现展开，先解释关键代码，再代入数字追踪任务和数据。第 13.13 节汇总运行与验证入口。下文的代码块以真实实现为依据，省略的模板声明、错误检查或外围循环会在上下文中说明；完整可编译文件仍以该目录为准。
+
+### 13.1 先换一个观察尺度：慢的是计算、调度，还是整条调用链？
+
+第 2.8 节用大方阵说明了 GEMM 的高算术强度。但 M、N、K 一变，瓶颈也可能跟着变。以 fp32、β=0、每份输入理想地只读一次为例：
+
+```
+AI_ideal = 2MNK / [4(MK + KN + MN)]
+
+大方阵 M=N=K：AI ≈ K/6，规模越大，复用潜力越高
+矩阵向量乘 M=1，K、N 都足够大：AI ≈ 2KN / (4KN) = 0.5 FLOP/Byte
+```
+
+后者即使没有重复读取，单位数据能支撑的计算也很少。此时优先考虑带宽、输入复用和批量组织，比继续扩大累加器更有意义。另一方面，一个很小的方阵可能既没跑满带宽，也没跑满算力，因为**根本没有足够多的并行任务，或时间主要花在提交工作上**。
+
+因此拿到一组新形状时，先从三个尺度观察：
+
+| 观察尺度 | 典型现象 | 接下来检查什么 |
+|----------|----------|----------------|
+| Block 内 | 数据等待多、Bank Conflict 多、寄存器 spill | 前文的分块、布局、流水线与指令组织 |
+| 整个 GPU | 部分 SM 空闲，末尾只剩少数 Block | tile 形状、Block 数量、Split-K、任务调度 |
+| 完整调用链 | GEMM 本身很快，但前后有拷贝、转换、小 kernel 或空隙 | 预打包、融合、批处理、资源复用与 CUDA Graphs |
+
+Nsight Compute 适合看前两类的 kernel 内部行为，Nsight Systems 适合看整条时间线。先定位尺度，可以避免"GPU 在等 CPU 提交工作，却一直修改 shared 布局"这样的无效优化。
+
+**先把数学符号和代码变量对齐。** 前文用 C 表示输出；这里为了演示 β 非零和重复计时，把旧 C 与新输出分开，计算 `D = αAB + βC_old`。配套代码用一个 `Problem` 描述这次计算：
+
+```cuda
+struct Problem {
+    const float *a, *b, *c, *bias;  // a/b 是输入，c 是只读 C_old
+    float* d;                     // 新输出，与输入分开存储
+    int m, n, k, lda, ldb, ldc, ldd;
+    float alpha, beta;
+};
+```
+
+例如默认 `M=129、N=193、K=65`，驱动设置 `lda=68、ldb=198、ldc=200、ldd=202`。它们分别表示四个矩阵相邻行起点的元素间距，不是子块大小，也不是字节数：
+
+```
+A[2][5] 的元素偏移：2×68  + 5 = 141
+B[5][7] 的元素偏移：5×198 + 7 = 997
+D[2][7] 的元素偏移：2×202 + 7 = 411
+```
+
+后面的优化经常只改一层映射：改变 Block 负责哪个输出块、改变 K 的遍历区间、改变 B 的物理布局。**先确认哪一层变了，哪些坐标和跨度仍沿用原矩阵**，就不容易把新的调度编号误当成内存下标。
+
+### 13.2 形状调优：大 Tile 的复用，能否抵消空算和尾波？
+
+#### 13.2.1 Tile Quantization：边缘块里有多少有效计算？
+
+前文不断增大 BM/BN 来提高复用，但输出矩阵不一定刚好被 tile 整除。例如 M=N=129，采用 128×128 的 Block Tile：
+
+```
+             列 0~127          列 128
+           ┌───────────────┬────────┐
+行 0~127   │ 完整 128×128   │ 只用1列 │
+           ├───────────────┼────────┤
+行 128     │ 只用1行        │ 只用1点 │
+           └───────────────┴────────┘
+```
+
+为了覆盖输出，仍需 4 个 Block。若底层按完整 tile 执行乘加，数据越界部分虽然被补零或屏蔽，计算资源却可能照样占用。这称为 **Tile Quantization（分块粒度造成的浪费）**。可以先估计 M/N 方向的有效面积比例：
+
+```
+Q = ceil(M/BM) × ceil(N/BN)             // 输出 tile 数
+有效面积比例 = MN / (Q × BM × BN)
+
+M=N=129：
+  128×128 tile：4 块，有效面积约 25.4%
+   64×64  tile：9 块，有效面积约 45.1%
+```
+
+小 tile 减少了边缘浪费，也增加了 Block 数量，但它的输入复用更低、循环与调度开销占比可能更高。因此这两个百分比不是性能预测，只是说明**大 tile 的理论复用可能花在了无效输出上**。
+
+瘦长矩阵更适合非方形 tile。例如 M=32、N 很大时，128×128 tile 在行方向只有 1/4 有效；尝试 32×128 或 32×64 往往比继续增大方形 tile 更合理。具体形状仍需满足所用 MMA 指令与线程布局的约束。
+
+#### 13.2.2 Wave Quantization：最后一批任务把 GPU 用满了吗？
+
+即使每个 tile 都是满的，整个 GPU 仍可能出现浪费。假设某个 kernel 在一块有 132 个 SM 的 GPU 上每 SM 驻留 1 个 Block，则同一时刻约能运行 **P=132 个 Block**。若一共只有 Q=133 个等量任务：
+
+```
+第一批：132 个 Block，所有 SM 都有活干
+第二批：  1 个 Block，其余 SM 闲着，等它算完
+```
+
+这种末尾不满一批的现象称为 **Wave Quantization（波次粒度造成的浪费）**，也是 Tail Effect（尾部效应）的一种。把每个 Block 的耗时近似看成相同，可以写成：
+
+```
+波次数 ≈ ceil(Q/P)
+任务槽利用比例 ≈ Q / [ceil(Q/P) × P]
+Q=133，P=132：约 50.4%
+```
+
+这是解释尾波的简化模型。实际 Block 会陆续开始和结束，并没有全局的"批次栅栏"；P 也由寄存器、shared、线程数、Cluster 和运行环境共同决定，不总等于 SM 数。第 2.7 节的 occupancy 在这里影响的是**一批能容纳多少任务**。
+
+因此调 BM/BN 时要同时看三笔账：**Block 内复用、边缘有效面积、全 GPU 任务数量**。小 tile 可能损失一点局部效率，却因为减少空算或尾波而让总时间下降。如果 M/N 太小，继续缩 tile 仍不够，就要向 K 维借并行度。
+
+#### 13.2.3 代码中的形状选择：一个模板怎样形成三种 Kernel
+
+对应 `kernels.cuh` 的 `Tile`。它把计算组织固定为 BM×BN 输出、BK 长度的输入段，每个线程持有 TM×TN 个累加器：
+
+```cuda
+template<int M, int N, int K, int TM_, int TN_>
+struct Tile {
+    static constexpr int BM = M, BN = N, BK = K, TM = TM_, TN = TN_;
+    static constexpr int Threads = BM * BN / (TM * TN);
+    struct Shared { float a[BM * BK], b[BK * BN]; };
+    struct Acc { float x[TM][TN]; };
+    // compute 和 store 在后面分析；源码还检查各维可整除、线程数为 256
+};
+
+using Small = Tile<32, 64, 16, 2, 4>;
+using Base  = Tile<64, 64, 16, 4, 4>;
+using Wide  = Tile<64, 128, 16, 4, 8>;
+```
+
+注意这里没有让每个线程直接负责一个输出：`Threads` 是输出面积除以每线程面积，所以三个版本都为 256 线程。代入默认问题 M=129、N=193：
+
+| 配置 | 输出块网格 | Block 数 Q | M/N 有效面积比例 | 每线程累加值 | A/B shared 合计 |
+|------|------------|------------|-----------------|--------------|----------------|
+| Small | 5×4 | 20 | 24897/40960 ≈ 60.8% | 8 | 6 KB |
+| Base | 3×4 | 12 | 24897/49152 ≈ 50.7% | 16 | 8 KB |
+| Wide | 3×2 | 6 | 24897/49152 ≈ 50.7% | 32 | 12 KB |
+
+这张表说明为什么不能只比 Q：Wide 的 Block 少，但每块做更多计算、用更多资源；Small 的边缘浪费少，但同样的数据在更多 Block 间重复搬运。按前文输入侧公式，三个配置的 fp32 AI 分别约为 10.7、16、21.3 FLOP/Byte，局部复用与全局任务数量正在相互拉扯。
+
+三个版本都使用 BK=16。K=65 需要 5 轮，实际小循环遍历到 80 个 k 位置，其中只有 65 个有效；若每轮都执行完整计算，K 方向还要乘一个 `65/80` 的有效比例。**M/N 的边缘、K 的尾段和全 GPU 的尾波是三种不同浪费**，分析时不要混在同一个百分比里。
+
+驱动 `launch` 用同一个公式生成网格，类型 T 决定具体的 tile：
+
+```cuda
+const int tiles = ceil_div(p.m, T::BM) * ceil_div(p.n, T::BN);
+const int grid = Persistent ? std::min(tiles, workers) : tiles;
+gemm_kernel<T, Persistent, Packed, Fast, UseBeta, Bias, Relu>
+    <<<grid, T::Threads, 0, stream>>>(p, group_rows);
+```
+
+普通模式下 `grid=tiles`；Persistent 模式的含义留到 13.4 节。**选择 tile 是编译出不同内核，不是把一个已经编译好的累加器在运行时变大。** 新增配置时，还要检查输出是否能按 TM/TN 整除、线程数、shared 用量及寄存器压力。
+
+#### 13.2.4 沿着线程 37 走一遍公共计算核心
+
+后面的调度版本都调用 `Tile::compute`，先把它看透。以 Base 为例，BN/TN=16，线程 37 的计算起点为：
+
+```cuda
+const int tr = (threadIdx.x / (BN / TN)) * TM;
+const int tc = (threadIdx.x % (BN / TN)) * TN;
+// threadIdx.x=37：tr=(37/16)×4=8，tc=(37%16)×4=20
+```
+
+因此该线程持有 tile 内行 8~11、列 20~23 的 4×4 结果。若 Block 输出起点为 `(m0,n0)=(64,128)`，它最终写全局 D 的行 72~75、列 148~151。
+
+**加载的分工却不是这 4×4 个位置。** 对 As，源码把 1024 个输入元素平均分给 256 个线程：
+
+```cuda
+for (int ix = threadIdx.x; ix < BM * BK; ix += Threads) {
+    const int r = ix / BK, c = ix % BK;
+    smem.a[ix] = (full || (m0 + r < p.m && k0 + c < p.k))
+        ? p.a[static_cast<std::size_t>(m0 + r) * p.lda + k0 + c] : 0.0f;
+}
+```
+
+固定 k0=0，线程 37 的四次搬运是：
+
+| ix | As 局部坐标 `(r,c)` | 从全局 A 读取的位置 |
+|----|--------------------|----------------------|
+| 37 | (2,5) | A[66][5] |
+| 293 | (18,5) | A[82][5] |
+| 549 | (34,5) | A[98][5] |
+| 805 | (50,5) | A[114][5] |
+
+对 Bs，同样四个 ix 按 BN=64 拆开，变成 `(0,37)、(4,37)、(8,37)、(12,37)`。**我搬的不是我独占使用的，我计算需要的也不全是我搬的**——这正是第 7.2 节“加载分工与计算分工解耦”的具体例子。
+
+加载后，全 Block 同步，再进入外积：
+
+```cuda
+__syncthreads();
+for (int kk = 0; kk < BK; ++kk) {
+    float ra[TM], rb[TN];
+    for (int i = 0; i < TM; ++i) ra[i] = smem.a[(tr + i) * BK + kk];
+    for (int j = 0; j < TN; ++j) rb[j] = smem.b[kk * BN + tc + j];
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j)
+            acc.x[i][j] = fmaf(ra[i], rb[j], acc.x[i][j]);
+}
+__syncthreads();
+```
+
+上面省略了源码的展开指示。固定 `kk=3、i=2、j=1`，线程 37 更新的是 `acc.x[2][1]`，对应全局 D[74][149]；本次乘数来自 A[74][3] 和 B[3][149]。换到下一个 K 段时，输出位置不变，两个输入的 k 同时前进 16。
+
+第一次同步保证其他线程搬的数据已经可读；第二次保证下一轮覆盖 shared 前，所有线程都读完。最终 `store` 用 `r=m0+tr+i、c=n0+tc+j` 恢复全局坐标，再按 ldd 写回。后面无论如何重新分派 Block，都必须保持这条“输入坐标 → 局部累加器 → 输出坐标”的对应关系。
+
+实验入口：`./gemm_advanced --demo core --m 129 --n 193 --k 65`。先对比三个 shape 的结果是否一致，再观察时间；改变形状但漏改某个步长，往往首先在这样的非整齐矩阵上暴露。
+
+### 13.3 Split-K：输出块太少，就把长点积拆给多个 Block
+
+#### 13.3.1 优化思路：并行计算部分和，再归约
+
+前文所有版本都是一个输出块由一个 Block 遍历完整 K。考虑 M=N=256、K=16384，采用 128×128 tile：输出只有 4 块，整个 GPU 只能同时忙 4 个 Block，而每块要算很久。
+
+**Split-K** 把 K 划成 S 段，让不同 Block 计算同一输出块的不同部分和：
+
+```
+C = A × B
+  = A[:, K段0] × B[K段0, :]
+  + A[:, K段1] × B[K段1, :]
+  + ...
+
+P[s] = 第 s 段的矩阵乘结果
+C    = Σ_s P[s]
+```
+
+上例若 S=32，每段 K=512，独立任务数从 4 增加到 **4×32=128**。这次增加的不是每个 SM 内的线程数，而是可以分派到不同 SM 的 Block 数——它解决的是全 GPU 并行度不足。
+
+最容易理解的实现分成两步：
+
+```text
+阶段一：grid 的 z 维表示 K 分段
+  Block(bm, bn, s) 计算该输出块在第 s 段上的部分和
+  将结果写入 workspace[s][m][n]
+
+阶段二：归约 kernel
+  对每个输出位置 (m,n)，读取所有 s 的部分和并相加
+  完成 α·sum + β·C_old，再做 bias/activation，写回输出
+```
+
+#### 13.3.2 收益与代价：并行度换来额外结果流量
+
+若 workspace 使用 fp32，完整保存 S 份 M×N 部分和：
+
+```
+workspace 容量 = S × M × N × 4 B
+部分和额外读写 ≈ 2 × S × M × N × 4 B
+
+M=N=256，S=32：workspace 为 8 MB，写入再读回约 16 MB
+```
+
+本章的 MB 按 1024² 字节计，额外流量不含最终 C 的写回。还要付出归约计算、额外 kernel 和更多主循环启动/收尾的开销。S 过大，每段 K 太短，流水线尚未展开就结束，收益会反转。
+
+因此 Split-K 特别适合 **M/N 小、K 大、原始输出任务明显不足**的情况。若原本已有大量输出块，额外归约很可能只增加成本。分段还应按 BK 或 MMA 的 K 粒度安排，并正确处理末尾。
+
+三个容易写错的地方：
+
+- **β·C_old 只能加一次**。每个分段都加，最后会变成 S 倍；bias 也一样。
+- **非线性激活必须在完整归约后做**。一般有 `ReLU(x+y) != ReLU(x)+ReLU(y)`。
+- **部分和的精度要单独考虑**。输出是 half，不意味着 workspace 也应使用 half；较低精度的部分和可能额外舍入或溢出，求和顺序变化也会改变浮点结果。
+
+另一种做法是用原子加合并部分和，可以减少完整 workspace，但会引入竞争、初始化与结果顺序问题。也有采用同步协议的串行归约方案。它们优化的是归约方式，不能简单地用一次普通 store 替代。
+
+> 相近的 **Sliced-K** 是把 K 分给同一 Block 内的多个 Warp，最后在 Block 内归约。它能改变一个 Block 内的并行组织，却不会像跨 Block 的 Split-K 那样增加分派到不同 SM 的输出任务数。
+
+#### 13.3.3 Split-K 代码逐步拆解：分段编号不是元素编号
+
+对应 `schedule.h::partition` 和 `kernels.cuh::split_k_kernel`。先看公共分段函数，以下去掉了 CPU/GPU 修饰符：
+
+```cpp
+Range partition(std::int64_t total, int rank, int parts) {
+    const auto base = total / parts;
+    const auto rem = total % parts;
+    const auto begin = base * rank + (rank < rem ? rank : rem);
+    return {begin, begin + base + (rank < rem)};
+}
+```
+
+它分配的是 `[0,total)` 中的整数单位。每份先分到 base 个，剩下 rem 个分别交给前 rem 份。因此第 rank 份之前已有 `base×rank + min(rank,rem)` 个单位；末尾再加上本份长度，得到左闭右开区间。
+
+在 Split-K 中，total 取 `ceil_div(K,BK)`。以 `K=65、BK=16、splits=3` 为例，total=5、base=1、rem=2：
+
+| z/rank | BK 迭代区间 | 逻辑 k 区间 | 真正有效的 k |
+|--------|-------------|-------------|---------------|
+| 0 | [0,2) | [0,32) | 0~31 |
+| 1 | [2,4) | [32,64) | 32~63 |
+| 2 | [4,5) | [64,80) | 只有 64，其余补零 |
+
+这样每段起点都对齐 BK，不会让某个 Block 从一个 shared tile 的中间开始。最后一段的有效元素少，但公共核心仍执行完整 BK 小循环；“分段平衡”首先平衡的是这些循环单位，而不是有效非零元素数。
+
+kernel 的关键部分如下，T 为公共 Tile 类型：
+
+```cuda
+const int nt = ceil_div(p.n, T::BN);
+const int m0 = (blockIdx.x / nt) * T::BM;
+const int n0 = (blockIdx.x % nt) * T::BN;
+const Range r = partition(ceil_div(p.k, T::BK), blockIdx.z, splits);
+T::template compute<false, true>(p, m0, n0, r.begin, r.end, smem, acc);
+
+p.d = partial + static_cast<std::size_t>(blockIdx.z) * p.m * p.n;
+p.ldd = p.n;
+p.alpha = 1.0f;
+T::template store<false, false, false>(p, m0, n0, acc);
+```
+
+逐项看它改变了什么：
+
+1. x 维仍负责输出 tile，除以/模 nt 还原二维块坐标；z 维只负责 K 分段。
+2. `compute` 接收的是 BK 迭代区间，内部再乘 BK 得到实际 k0；不能把 r.begin 当成元素坐标传给加载地址。
+3. `p.d` 改为本段 workspace 的起点，`p.ldd=p.n` 表示部分和紧密存储；原来最终输出的 padding 不复制到 workspace。
+4. `p.alpha=1`，且三个 store 模板开关全为 false，因此写入的是原始部分和。这里修改的是按值传入 kernel 的 p，不会把 host 上的 α 改掉。
+
+#### 13.3.4 从一个部分和地址追到最终输出
+
+选取 `M=65、N=97、K=65、Base=64×64`，输出有 2×2=4 个 tile，启动 `grid=(4,1,3)`。`blockIdx=(3,0,2)` 对应右下输出块 `(m0,n0)=(64,64)`，计算最后一个 K 段。
+
+追踪 D[64][96]：它在该 tile 内位于 `(0,32)`，属于有效输出。第三份部分和的地址是：
+
+```
+partial[2][64][96]
+元素偏移 = 2×(65×97) + 64×97 + 96 = 18914
+```
+
+而最终 D 的行跨度为 `ldd=N+9=106`，地址是 `64×106+96=6880`。**中间结果和最终结果的行跨度不同，不能复用同一个线性地址。** 归约 kernel 正是先在紧密输出编号 ix 上遍历，再恢复 r/c：
+
+```cuda
+const std::size_t count = static_cast<std::size_t>(p.m) * p.n;
+// 以下为每个有效 ix 的处理，外层使用 grid-stride 循环
+float sum = 0;
+for (int s = 0; s < splits; ++s) sum += partial[s * count + ix];
+const int r = ix / p.n, c = ix % p.n;
+p.d[static_cast<std::size_t>(r) * p.ldd + c] =
+    epilogue<true, Bias, Relu>(p, r, c, sum);
+```
+
+假设某输出的三份部分和为 `2、-5、4`，完整点积就是 1。取 `α=0.75、β=-0.25、C_old=4、bias=0.5`，正确融合结果是 `ReLU(0.75×1-0.25×4+0.5)=0.25`。若在每份部分和里重复加 C_old/bias，线性部分已变错；若提前做 ReLU，连 `ReLU(2-5+4)=1` 与 `ReLU(2)+ReLU(-5)+ReLU(4)=6` 都不相同。
+
+两个 kernel 发到同一 stream，归约自然排在所有部分和写回之后；无需跨 Block 自旋，也无需 CPU 在两次 launch 中间等待。workspace 必须活到归约完成，而且容量计算、指针偏移都使用足够宽的整数。
+
+运行 `./gemm_advanced --demo split --m 65 --n 97 --k 65 --split 3`，同时检查普通归约和融合归约。把 `--split` 改得大于 BK 迭代数时，驱动会限制到迭代数，避免本示例产生空分段。
+
+#### 13.3.5 Sliced-K 代码：同一个线程，计算与归约时有不同角色
+
+`sliced_k_kernel` 采用 BM=16、BN=32、BK=32，一个 Block 有 256 个线程。计算阶段把线程分成 4 组，每组 64 个线程、2 个 Warp：
+
+```cuda
+const int part = threadIdx.x / 64, local = threadIdx.x % 64;
+const int row_base = local / BN, col = local % BN;
+float acc[8] = {};
+
+// 每轮输入由全 Block 装载，__syncthreads() 后执行：
+for (int k = part * 8; k < (part + 1) * 8; ++k) {
+    const float bv = b[k * BN + col];
+    for (int i = 0; i < 8; ++i)
+        acc[i] = fmaf(a[(row_base + 2 * i) * BK + k], bv, acc[i]);
+}
+```
+
+组内 local=0~31 对应偶数行 `0,2,...,14`，local=32~63 对应奇数行 `1,3,...,15`，每个线程负责一个列上的 8 个结果。因此**每组都覆盖完整的 16×32 输出，但只覆盖 8 个 k**。
+
+以 K=19、线程 137 为例：part=2、local=9、row_base=0、col=9。它负责行 0/2/.../14、列 9，计算 k=16~23；其中只有 16~18 有效，19~23 已在装载时补零。第四组计算 k=24~31，这一轮贡献全为零，但仍参加所有 Block 栅栏。
+
+整个 K 循环结束后，将 4 组结果按 `partial[part][row][col]` 放进 shared：
+
+```cuda
+for (int i = 0; i < 8; ++i)
+    partial[(part * BM + row_base + 2 * i) * BN + col] = acc[i];
+__syncthreads();
+for (int ix = threadIdx.x; ix < BM * BN; ix += 256) {
+    // 有效输出时，对四个组的相同位置归约
+    float sum = 0;
+    for (int s = 0; s < Parts; ++s) sum += partial[s * BM * BN + ix];
+    // 随后执行 epilogue 并按 p.ldd 写回；边界判断见完整源码
+}
+```
+
+线程 137 的 `acc[3]` 对应行 6、列 9，写入下标 `(2×16+6)×32+9=1225`。归约时，输出的局部线性编号是 `6×32+9=201`，由线程 201 读取四份下标 `201、713、1225、1737` 并相加。
+
+这个例子也解释了中间 `__syncthreads()` 的必要性：写部分和的线程与最终读取它的线程不一定在同一 Warp。A/B 缓冲共 6 KB、部分和共 8 KB，总共 14 KB shared；省掉了 global workspace 和第二个 kernel，但增加了 Block 内 shared 存储与归约。由于这里还改变了输出 tile 形状，计时不是仅改变 K 分工的单变量对照。
+
+### 13.4 Persistent GEMM 与 Stream-K：把任务分得更均匀
+
+#### 13.4.1 Persistent GEMM：让一组 Block 连续领取工作
+
+普通 GEMM 的映射是"一个输出 tile 对应一个 Block"。另一种方式是只启动一组可长期工作的 Block，每个 Block 算完一个 tile 后，再领取下一个，这称为 **Persistent GEMM（持久化 GEMM）**。
+
+最简单的静态分配，就是把前文的 tile 索引放进一个 grid-stride 循环。下面是调度伪代码，循环控制在 Block 内一致：
+
+```text
+tile_id = blockIdx.x
+while tile_id < 总输出tile数:
+    根据 tile_id 求出输出块坐标
+    清零本 tile 的累加器
+    遍历 K，完成这个 tile 的 GEMM
+    写回，并确认旧的异步工作不再使用缓冲
+    tile_id += gridDim.x
+```
+
+它可以摊销一部分 Block 级初始化和调度开销，也为更复杂的工作分配提供载体。Hopper 上第 11 章的生产者/消费者流水线，就可以在这样的长生命周期 Block 中运行。**shared 分配被复用，不等于旧数据自动有用**；要跨 tile 保留某份 A/B，还必须专门安排索引、依赖和覆盖时机。
+
+Persistent 也不会自动消除尾波。Q=133、只启动 132 个 Block 时，如果任务仍按完整 tile 分，一个 Block 仍要做两块，其他只做一块。对于耗时不均的任务，可用动态工作队列改善分配，但领取任务、广播 tile 编号和维护状态也有成本。更细地平衡工作量，还需要改变任务粒度。
+
+**对应代码：为什么只改变 grid 大小还不够？** `gemm_kernel` 必须有继续领取 tile 的循环，否则少启动的那些 Block 对应的输出会直接漏掉：
+
+```cuda
+const int mt = ceil_div(p.m, T::BM), nt = ceil_div(p.n, T::BN);
+for (int id = blockIdx.x; id < mt * nt; id += gridDim.x) {
+    const TileCoord coord = tile_coord(id, mt, nt, group_rows);
+    T::template compute<Packed, FastInterior>(p, coord.m * T::BM, coord.n * T::BN,
+                                             0, ceil_div(p.k, T::BK), smem, acc);
+    T::template store<UseBeta, Bias, Relu>(p, coord.m * T::BM, coord.n * T::BN, acc);
+    if constexpr (!Persistent) break;
+    __syncthreads();
+}
+```
+
+暂取 `group_rows=1`，即 `coord=(id/nt,id%nt)`。默认问题有 Q=12 个 Base 输出块，若指定 5 个 worker：
+
+| Block | 顺序处理的 id | 对应输出块坐标 `(块行,块列)` |
+|-------|---------------|---------------------------------|
+| 0 | 0、5、10 | (0,0)、(1,1)、(2,2) |
+| 1 | 1、6、11 | (0,1)、(1,2)、(2,3) |
+| 2 | 2、7 | (0,2)、(1,3) |
+| 3 | 3、8 | (0,3)、(2,0) |
+| 4 | 4、9 | (1,0)、(2,1) |
+
+`id=11` 的输出起点是 `(128,192)`，只有一行一列有效，仍交给公共边界逻辑处理。所有 id 对 5 的余数唯一，因此不会漏算或重复。每次 `compute` 都重新清零 acc；若把清零错误地移到这个持久化循环外，第二个 tile 就会继承第一个 tile 的结果。
+
+循环控制只依赖 Block 编号和矩阵尺寸，整个 Block 路径一致。循环尾的栅栏把本 tile 的工作与下一次 shared 使用分开；若将计算核心换成异步拷贝/WGMMA，还必须先完成它们各自的等待协议，不能只保留普通线程栅栏。
+
+驱动的默认 worker 数来自：
+
+```cuda
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &resident, gemm_kernel<Base, true>, Base::Threads, 0);
+const int default_workers = prop.multiProcessorCount * std::max(1, resident);
+```
+
+这是该具体 kernel 的资源上限估计，不是"每个 Block 固定绑定一个 SM"的指令。可用 `--demo core --workers 5` 观察上述分配；改成 1 会串行处理全部 tile，改得超过 Q 则由 launcher 限制到 Q。
+
+#### 13.4.2 Stream-K：按 K 段工作量，而不只按完整输出块分工
+
+Split-K 给每个输出 tile 固定切 S 份；**Stream-K** 则从全部乘加工作出发，将各输出 tile 的 K 迭代排成一个工作序列，再按工作量分给 Block。一个 Block 可以完成某个 tile 的尾段，再接着算下一个 tile 的开头。
+
+```
+原始任务： [tile 0 的全部 K][tile 1 的全部 K][tile 2 的全部 K]...
+细分工作： [0,0][0,1]...[0,L-1][1,0][1,1]...[1,L-1]...
+                                      ↑
+                         每格表示一个输出 tile 的一段 BK 计算
+```
+
+若有 Q 个输出 tile、每个 tile 有 L 次 BK 迭代，总工作格数就是 `U=Q×L`。仍用 Q=133、P=132，并令 L=128：
+
+```
+按完整 tile 分：最忙的 Block 要做 2×128 = 256 格
+按工作量均分：  最忙的 Block 约做 ceil(133×128/132) = 129 格
+```
+
+这是忽略归约、初始化和缓存影响的负载模型，不是实际加速比。它说明 Stream-K 为什么能缓解"只多一个 tile，却多等近一整块时间"的问题。
+
+代价是跨 Block 切开的输出 tile 需要合并部分和，并维护完成协议；各 Block 沿 K 的进度不一致，还可能影响缓存复用。实际实现常混合普通整 tile 计算与 Stream-K，只在值得平衡的部分付出归约开销，而不是把所有 tile 都切碎。
+
+三者的区别可以这样记：**Persistent 决定 Block 是否连续接任务，Split-K 决定一个输出是否固定拆成多份，Stream-K 决定是否按总工作量划分任务边界**。它们可组合使用，并非三个互斥的 kernel 指令。
+
+#### 13.4.3 Stream-K 计划：用一个能手算的例子展开所有区间
+
+对应 `schedule.h::make_streamk_plan`。选 `M=32、N=129、K=65`，Base 输出有 `Q=1×3=3` 个 tile，每个 tile 有 `L=5` 次 BK 迭代，总工作量 U=15。用 4 个 worker，调用上一节的 `partition(15,w,4)`：
+
+```
+tile 0：位置 0~4     tile 1：位置 5~9     tile 2：位置 10~14
+worker 0：[0,4)      worker 1：[4,8)
+worker 2：[8,12)     worker 3：[12,15)
+```
+
+每个位置 pos 可拆成 `tile=pos/L` 与 `tile内K迭代=pos%L`。一个 worker 遇到 tile 边界就必须结束当前部分和，否则会把两个不同输出块累加到同一份 acc。源码因此使用：
+
+```cpp
+plan.worker_offsets.push_back(0);
+plan.tile_offsets.assign(tiles + 1, 0);
+for (int w = 0; w < workers; ++w) {
+    const Range work = partition(total, w, workers);
+    for (auto pos = work.begin; pos < work.end;) {
+        const int tile = static_cast<int>(pos / kt);
+        const auto stop = std::min(work.end, (static_cast<std::int64_t>(tile) + 1) * kt);
+        plan.segments.push_back({tile, static_cast<int>(pos % kt),
+                                 static_cast<int>(stop - static_cast<std::int64_t>(tile) * kt)});
+        ++plan.tile_offsets[tile + 1];
+        pos = stop;
+    }
+    plan.worker_offsets.push_back(static_cast<int>(plan.segments.size()));
+}
+```
+
+`kt` 就是上面的 L。stop 取"本 worker 终点"与"当前 tile 终点"中较近的一个，保证每个 Segment 只属于一个输出 tile。依次执行后得到：
+
+| slot | worker | 输出 tile | tile 内 BK 区间 | 对应扁平工作区间 |
+|------|--------|-----------|----------------|------------------|
+| 0 | 0 | 0 | [0,4) | [0,4) |
+| 1 | 1 | 0 | [4,5) | [4,5) |
+| 2 | 1 | 1 | [0,3) | [5,8) |
+| 3 | 2 | 1 | [3,5) | [8,10) |
+| 4 | 2 | 2 | [0,2) | [10,12) |
+| 5 | 3 | 2 | [2,5) | [12,15) |
+
+对应 `worker_offsets=[0,1,3,5,6]`：worker 1 处理 slots `[1,3)`，即 slot 1 和 2；worker 2 处理 slot 3 和 4。各 worker 工作量为 4、4、4、3，**平衡的是 BK 迭代数，而不是 segment 个数**。
+
+#### 13.4.4 归约表：怎样知道一个输出要找哪些 Slot？
+
+创建 segment 时，`tile_offsets[tile+1]` 先被当作计数器。上例每个 tile 都有两份贡献，计数数组是 `[0,2,2,2]`；做前缀和后变成 `[0,2,4,6]`。然后填入 slot 编号：
+
+```cpp
+for (int t = 0; t < tiles; ++t)
+    plan.tile_offsets[t + 1] += plan.tile_offsets[t];
+plan.tile_slots.resize(plan.segments.size());
+auto cursor = plan.tile_offsets;
+for (int s = 0; s < static_cast<int>(plan.segments.size()); ++s)
+    plan.tile_slots[cursor[plan.segments[s].tile]++] = s;
+```
+
+`cursor` 是写入进度，必须复制一份；若直接递增 `tile_offsets`，就会毁掉后续归约需要的区间起点。上例 `tile_slots=[0,1,2,3,4,5]`，因此：
+
+```
+tile 0：取 tile_slots[0:2] → slot 0、1
+tile 1：取 tile_slots[2:4] → slot 2、3
+tile 2：取 tile_slots[4:6] → slot 4、5
+```
+
+这种"前缀和指定区间，区间里存贡献编号"的表示叫 CSR 式列表。它记录的是调度关系，不是稀疏矩阵输入；本例的 A/B 仍然是 dense。
+
+#### 13.4.5 GPU 端：为什么一个 worker 需要重新清零多次？
+
+`streamk_partials_kernel` 按 worker 领取上述列表，再逐段调用公共核心：
+
+```cuda
+for (int slot = worker_offsets[blockIdx.x]; slot < worker_offsets[blockIdx.x + 1]; ++slot) {
+    const Segment task = segments[slot];
+    T::template compute<false, true>(p, (task.tile / nt) * T::BM,
+                                     (task.tile % nt) * T::BN,
+                                     task.k_begin, task.k_end, smem, acc);
+    // tr/tc 与 Base 中的线程输出映射相同
+    for (int i = 0; i < T::TM; ++i)
+        for (int j = 0; j < T::TN; ++j)
+            partial[(static_cast<std::size_t>(slot) * T::BM + tr + i) * T::BN + tc + j]
+                = acc.x[i][j];
+    __syncthreads();
+}
+```
+
+worker 1 的 slot 1 属于 tile 0，slot 2 属于 tile 1，所以它每进入一次 `compute` 都必须重新清零累加器。各 slot 存完整 BM×BN 区域，地址互不重叠；边缘无效位置也有存储空间，不会写到别人的 slot。
+
+第二个 kernel 再从有效输出位置反查 tile 和局部下标：
+
+```cuda
+const int r = ix / p.n, c = ix % p.n;
+const int tile = (r / T::BM) * nt + c / T::BN;
+const int local = (r % T::BM) * T::BN + c % T::BN;
+float sum = 0;
+for (int j = tile_offsets[tile]; j < tile_offsets[tile + 1]; ++j)
+    sum += partial[static_cast<std::size_t>(tile_slots[j]) * T::BM * T::BN + local];
+// 对完整 sum 执行一次 epilogue，再写 D
+```
+
+追踪上例 D[2][70]：tile=1、local=`2×64+6=134`，所以读取 slot 2 和 3 的地址 `2×4096+134=8326`、`3×4096+134=12422`。slot 2 贡献 k=0~47，slot 3 贡献 k=48~64，其余尾段为零，合起来恰好覆盖 K=65。
+
+本例共 6 个 slot，workspace 为 `6×64×64×4=96 KB`。所有 segment 都先落 global，再由第二个 kernel 合并，连完整 tile 也如此，所以它是**可核对的两阶段 Stream-K 教学实现**。优化版可让完整 tile 直接写最终结果，只对拆开的部分付出归约成本；也可混合普通调度来改善缓存局部性。
+
+运行 `./gemm_advanced --demo streamk --m 32 --n 129 --k 65 --workers 4`，即可得到这个任务规模。增大 workers 会缩短每个工作区间，却可能增加 segment 与归约开销；不能只比较第一阶段的时间。
+
+### 13.5 L2 复用：让需要相同数据的 Block 尽量靠近执行
+
+V2 把 Block 内的重复读取放进 shared；第 6.5 节还留下了 Block 之间的重复读取。对 C 的一个 2×2 输出 tile 区域，在同一个 K 段中：
+
+```
+               B0             B1
+         ┌─────────────┬─────────────┐
+    A0   │  C00=A0×B0  │  C01=A0×B1  │  ← 共用 A0
+         ├─────────────┼─────────────┤
+    A1   │  C10=A1×B0  │  C11=A1×B1  │  ← 共用 A1
+         └─────────────┴─────────────┘
+                ↑              ↑
+              共用 B0        共用 B1
+```
+
+4 个 Block 分别请求 4 份 A tile、4 份 B tile，但实际不同的数据只有 **A0、A1、B0、B1**。如果时间上靠近，后来的读取就更可能命中 L2；相隔太远，数据可能已经被其他访问替换掉。
+
+**Block Swizzle / Threadblock Rasterization** 因此重排一维任务编号到二维输出 tile 的映射，让相邻编号尽量落在输出矩阵的一个小区域，而不是沿一个很长的方向扫到底。例如对 4×4 的 tile 网格，按 2×2 小区域分组：
+
+```
+普通逐行映射：                 2×2 分组映射：
+  0   1   2   3                0   1   4   5
+  4   5   6   7                2   3   6   7
+  8   9  10  11                8   9  12  13
+ 12  13  14  15               10  11  14  15
+```
+
+图中数字是任务编号。CUDA 不承诺按编号严格调度，因此这里改善的是**同时访问相同数据的机会**，不是建立跨 Block 的执行顺序或同步保证。
+
+这里的 Block Swizzle 改的是"哪个任务编号负责哪个输出块"；第 11 章的 shared swizzle 改的是"矩阵元素在共享内存中怎样摆放"。两者作用层次不同，可以配合使用。
+
+分组也不能无限大。若一个局部组包含 Gm×Gn 个输出 tile，同一 K 段涉及的不同输入约为：
+
+```
+局部输入工作集 ≈ sizeof(input) × BK × (Gm×BM + Gn×BN)
+```
+
+工作集、在途 K 段以及其他任务都会占用 L2。分组方向还应考虑矩阵长宽、A/B 的大小和复用需求：优先横向邻近有利于复用 A，优先纵向邻近有利于复用 B。改动后应同时看 L2 命中、HBM 字节数和总时间，不能只看命中率。
+
+部分架构还提供 L2 持久化访问策略，可对反复访问的区域设置缓存偏好。它适合有明确复用的权重区域，但仍是容量受限的缓存策略，不会把整份权重永久锁在 L2；多个流争用时也可能挤压其他数据。与 TMA multicast 相比，这里的复用主要依靠缓存，通常不需要 Cluster 协作。
+
+#### 13.5.1 代码中的 grouped-M 映射：最后一组为什么要特殊处理？
+
+配套 `tile_coord` 采用沿 M 分组、组内优先遍历 M 的方式，与上面的 2×2 分组示意不同，但目的相同：让邻近任务访问有重叠的数据。
+
+```cpp
+TileCoord tile_coord(int id, int mt, int nt, int group_rows) {
+    const int group_size = group_rows * nt;
+    const int first_m = (id / group_size) * group_rows;
+    const int remaining = mt - first_m;
+    const int rows = remaining < group_rows ? remaining : group_rows;
+    const int inner = id % group_size;
+    return {first_m + inner % rows, inner / rows};
+}
+```
+
+这里 mt/nt 是输出 tile 网格的行列数。假设 mt=5、nt=3、group_rows=2，则一个完整组有 6 个任务。代入所有 id 后，各输出位置上的任务编号为：
+
+```
+            块列0  块列1  块列2
+块行0          0      2      4
+块行1          1      3      5
+块行2          6      8     10
+块行3          7      9     11
+块行4         12     13     14
+```
+
+id=0、1 对应同一块列的相邻两块行，需要相同的 B 子块；id=2、3 再移到下一块列。最后一组只剩块行 4：id=13 时 `first_m=4、remaining=1、rows=1、inner=1`，得到 `(4,1)`。若错误地仍用 group_rows=2 做取模，会得到 `(5,0)`，既越界又漏算正确位置。
+
+这段函数的前提是 `0<=id<mt×nt`、mt/nt/group_rows 为正；launcher 和循环边界负责保证。group_rows=1 自动退化成逐行映射。它只改变任务编号，**完全不改变 A/B 的 leading dimension，也不改变 tile 内的线程映射**。
+
+可用 `--demo core --m 257 --n 129 --k 65 --group-rows 2` 生成上述 5×3 网格。正确性应与普通映射一致，性能差异才可能归因于执行邻近性与缓存行为；CUDA 仍不保证按这张编号表严格执行。
+
+#### 13.5.2 L2 访问窗口代码：预算、窗口与 hitRatio 各管什么？
+
+`gemm_advanced.cu` 的 `cache` 分支先查询设备能力，再设置策略。下面整理出实际执行的关键调用，省略错误检查与对照计时：
+
+```cuda
+cudaDeviceGetLimit(&original, cudaLimitPersistingL2CacheSize);
+cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, budget);
+
+cudaStreamAttrValue attr{};
+attr.accessPolicyWindow.base_ptr = const_cast<float*>(p.b);
+attr.accessPolicyWindow.num_bytes = bytes;
+attr.accessPolicyWindow.hitRatio = std::min(1.0, static_cast<double>(budget) / bytes);
+attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+```
+
+三个量不要混淆：budget 是允许用于持久化策略的 L2 预算，bytes 是 B 上应用策略的连续地址窗口，hitRatio 是窗口内访问被赋予指定优先策略的比例提示，不是测量出来的缓存命中率。
+
+假设设备允许设置 4 MB 预算，最大窗口为 8 MB，而 B 占 6 MB，则可对 6 MB 地址窗口设置 `hitRatio=4/6≈0.667`。这不等于“将前 4 MB 永久存入缓存”，也不保证 2/3 的访问一定命中；实际缓存还受并发访问、替换和访问顺序影响。
+
+源码把 budget 限制为允许的持久化容量与半个 L2 中的较小者，把 bytes 限制为 B 的物理大小与最大窗口中的较小者。测试结束，等待相关工作完成后清除策略：
+
+```cuda
+attr.accessPolicyWindow.num_bytes = 0;
+cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+cudaCtxResetPersistingL2Cache();
+cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, original);
+```
+
+窗口绑定到 stream，而数据只是该 stream 的 kernel 将要访问的 B；不能只在一个流上设置后期待所有流自动使用同样的策略。若普通预热已经使小 B 命中 L2，`--demo cache` 可能几乎没有收益。MIG/MPS 和其他执行环境还可能限制这项配置，程序应按实际能力判断，而不是只按 GPU 名称判断。
+
+### 13.6 对齐、边界与预打包：让准备数据的成本只付必要的次数
+
+#### 13.6.1 把内部整块与边缘路径分开
+
+通用 kernel 要检查边界，但大矩阵的大部分 tile 都在内部。可以让内部 tile 使用无逐元素边界判断的快路径，只有边缘 tile 才补零、做 predication（按条件屏蔽访问）或使用较小的计算形状。对完整 Block 的判断可以保持一致分支；如果拆成两个 kernel，则要计入额外启动成本。
+
+Padding 是另一种选择：把存储跨度或逻辑计算尺寸扩到方便向量化/MMA 的倍数。这里要区分两件事：
+
+- **只扩存储跨度**：逻辑 M/N/K 不变，改变 lda/ldb/ldc，让每行起点满足对齐；
+- **扩计算尺寸**：实际多算一些补零行列或 K 项，再裁剪有效输出。
+
+第二种方案的计算膨胀比例约为 `M'·N'·K' / (M·N·K)`。对很小或刚跨过 tile 边界的矩阵，这笔多算的成本可能很大。WMMA 的固定块要求、某个 cuBLAS 算法的对齐要求和整个库能否处理非整齐尺寸，也不是同一层限制。
+
+**公共核心如何判断“完整内部块”？** 回到 `Tile::compute`，判断发生在每轮 K 段，而不只发生在 Block 入口：
+
+```cuda
+const int k0 = tile_k * BK;
+const bool full = FastInterior && m0 + BM <= p.m &&
+                  n0 + BN <= p.n && k0 + BK <= p.k;
+// A 的一次加载；B 也按对应的行列条件处理
+smem.a[ix] = (full || (m0 + r < p.m && k0 + c < p.k))
+    ? p.a[static_cast<std::size_t>(m0 + r) * p.lda + k0 + c] : 0.0f;
+```
+
+取默认矩阵与 Base，三个情况逐项代入：
+
+| 输出起点 `(m0,n0)` | k0 | full | 原因 |
+|--------------------|----|------|------|
+| (64,128) | 48 | true | 行到127、列到191、k到63，均有效 |
+| (64,128) | 64 | false | 输出是整块，但 K 只剩一个有效元素 |
+| (128,192) | 0 | false | 输出只剩一行一列 |
+
+如果只在 kernel 开头按 M/N 判断 full，第二行就会读到 K 尾部之外。此时某些地址还落在已分配的行尾 padding 中，未必触发非法地址异常，却会把错误数据算进结果——这就是驱动在 padding 中放 NaN 的用途之一。
+
+以最后一轮 k0=64 为例，As 的局部列 c=0 仍有效，c=1~15 必须写零；Bs 的局部行 r=0 有效，r=1~15 必须写零。仅屏蔽写回 D 不够，因为坏输入已经可能污染有效输出。
+
+这个实现通过同一个 kernel 内的条件选择处理边缘，所有线程仍执行两次 Block 栅栏。`FastInterior=false` 关闭的是完整块快捷判断，不是边界保护；它仍逐元素检查并补零。是否真的减少机器指令，要结合编译结果看，而不能把 full=true 直接当成固定加速倍数。
+
+#### 13.6.2 先传布局，再考虑物理转置
+
+第 12 章为了简化 kernel 使用了 `contiguous()`，但在真实调用中，物化一次转置可能比小 GEMM 本身还贵。若输入本来就是普通转置视图，优先看能否用库的 transpose 标志和 leading dimension 表达，或让 kernel 直接支持该布局。
+
+只有当转换后的布局确实让后续计算更快，才值得物理重排。对固定权重 B，这引出 **Prepacking（预打包）**：提前将它转换成计算内核喜欢的排列、对齐和数据格式，后续调用重复使用。
+
+```
+每次转换：  [转换B][GEMM] [转换B][GEMM] [转换B][GEMM] ...
+预打包：    [转换B]       [GEMM]       [GEMM]       [GEMM] ...
+```
+
+设一次打包耗时 Tp，普通布局每次计算 T0，打包后每次 T1，权重复用 R 次：
+
+```
+预打包有收益的条件：Tp + R×T1 < R×T0
+即 R > Tp / (T0 - T1)，且 T1 < T0
+```
+
+例如 Tp=0.4 ms、每次省 0.02 ms，要复用超过 20 次才摊得回来。这适合重复推理中的固定权重；训练中权重每步更新，就必须计入重新打包。额外副本占用、版本失效和下游所需布局也都属于这笔账。
+
+#### 13.6.3 打包代码：从目标位置反推源矩阵坐标
+
+`pack_b_kernel<Base>` 将 B 排为 `[tile_n][tile_k][BK][BN]`，其中 BN 变化最快。让线程连续写目标数组，再由目标线性编号 ix 反解四个维度：
+
+```cuda
+const int c = ix % T::BN;
+const int r = (ix / T::BN) % T::BK;
+const int kt = ceil_div(p.k, T::BK);
+const int tk = (ix / (T::BN * T::BK)) % kt;
+const int tn = ix / (static_cast<std::size_t>(T::BN) * T::BK * kt);
+const int row = tk * T::BK + r, col = tn * T::BN + c;
+packed[ix] = row < p.k && col < p.n
+    ? p.b[static_cast<std::size_t>(row) * p.ldb + col] : 0.0f;
+```
+
+外层是 grid-stride 循环，每个 ix 只被一个线程写一次。除法相当于不断去掉内层维度，取模则取出当前维度的坐标。这与第 2.6 节把二维数组拍扁互为逆过程。
+
+用 `K=19、N=70、BK=16、BN=64` 举例，B 有 2 个 N tile、2 个 K tile。追踪 B[17][67]：
+
+```
+源坐标：row=17，col=67，ldb=N+5=75
+源偏移：17×75+67 = 1342
+
+分块坐标：tn=1，tk=1，r=1，c=3
+目标偏移：((tn×kt+tk)×BK+r)×BN+c
+        = ((1×2+1)×16+1)×64+3 = 3139
+```
+
+反过来将 ix=3139 代入代码，得到 c=3、r=1、tk=1、tn=1，正好回到同一个源元素。每次打包需要的容量是 `2×2×16×64=4096` 个 float，而逻辑 B 只有 `19×70=1330` 个 float；小问题的 padding 膨胀在这里很明显。
+
+再看两个边界：目标中代表 B[19][67] 的位置要写零，因为 row=19 已超出 K；代表 B[17][70] 的位置也要写零，虽然它在原分配中可能还属于行尾 padding。**打包的有效性由逻辑 K/N 决定，不能由“地址还在 allocation 里”决定。**
+
+#### 13.6.4 消费端如何读回，以及怎样公平计算收益
+
+计算方用同一套正向索引读取：
+
+```cpp
+std::size_t packed_b_index(int tile_n, int tile_k,
+                           int r, int c, int kt, int bk, int bn) {
+    return ((static_cast<std::size_t>(tile_n) * kt + tile_k) * bk + r) * bn + c;
+}
+```
+
+`Tile::compute` 的 Packed=true 分支相应使用：
+
+```cuda
+smem.b[ix] = p.b[packed_b_index(n0 / BN, tile_k, r, c,
+                               ceil_div(p.k, BK), BK, BN)];
+```
+
+例如计算从 n0=64 开始的输出块，在 tile_k=1、局部 `(r,c)=(1,3)` 时，正好读取 packed[3139]，再放到 shared 中正常参与乘法。**只有 global B 的存储方式改变，shared 的 BK×BN 形状与后面的外积没有改变。**
+
+驱动中使用 `Problem pp=p; pp.b=packed.data`，再调用 `launch<Base,false,true>(pp,stream)`；第三个模板参数 Packed 为 true。原 p 仍表示普通 B，供未打包对照使用。p.n/p.k 保持逻辑尺寸，Packed 分支不再用普通 ldb 计算 B 地址。
+
+这也给出两个必须成对检查的条件：打包时的 BK/BN 与消费配置一致，且所有 padding 都已写零。只替换指针而忘记切换 Packed 分支，会把新布局当普通矩阵读，结果直接错误。
+
+代码对同一份数据测量 `unpacked-B`、`packed-B-steady`、`pack-plus-gemm`，并单独测 pack。假设仅作算例的时间是 `Tp=40 μs、T0=100 μs、T1=80 μs`：复用 1 次时新方案花120 μs，反而慢；复用3次时花280 μs，比原来的300 μs少。若 T1≥T0，重复多少次也无法靠这笔稳态差额回本。
+
+实验入口：`./gemm_advanced --demo packed --m 33 --n 70 --k 19`。这个例子适合验证坐标与补零，不意味着打包在这么小的形状上应当更快。
+
+### 13.7 融合与代数重组：减少矩阵乘前后本来不必落地的数据
+
+#### 13.7.1 Epilogue 融合：一次写回代替多轮读改写
+
+第 11.7 节介绍了 Epilogue。这里把收益算清楚。考虑：
+
+```
+T = A × B
+U = T + bias
+D = ReLU(U)
+```
+
+若三个 kernel 分别执行，且中间结果均为 fp32，忽略 A/B 和很小的 bias 向量，输出侧流量为：
+
+```
+GEMM：写 T                         4MN B
+bias：读 T + 写 U                  8MN B
+ReLU：读 U + 写 D                  8MN B
+合计：                            20MN B
+
+融合到 GEMM 写回前：只写 D          4MN B
+```
+
+M=N=4096 时，少掉的 `16MN B` 是 **256 MB** 的逻辑读写流量，还减少两个 kernel 启动。缓存会影响实际 HBM 流量，但消除中间数组和读写指令的收益仍然存在。若 bias 与 ReLU 本来已融合为一个后处理 kernel，再融合到 GEMM 的增量收益就是 `8MN B`，不能重复计算。
+
+融合也会增加寄存器活跃范围、指令数量和 epilogue 的耗时。K 很大时主循环占主导，收益可能有限；K 较小或输出矩阵很大时，后处理往往更值得优化。跨行归约、复杂激活或多个下游消费者还会增加实现难度，要比较完整链路而非只看 GEMM 内核的 TFLOPS。
+
+**对应代码：哪些操作从独立 kernel 移到了写回前？** 公共 `epilogue` 由三个编译期开关控制：
+
+```cuda
+template<bool UseBeta, bool Bias, bool Relu>
+__device__ float epilogue(const Problem& p, int row, int col, float acc) {
+    float out = p.alpha * acc;
+    if constexpr (UseBeta)
+        out += p.beta * p.c[static_cast<std::size_t>(row) * p.ldc + col];
+    if constexpr (Bias) out += p.bias[col];
+    if constexpr (Relu) out = fmaxf(out, 0.0f);
+    return out;
+}
+```
+
+`Tile::store` 先检查 `(row,col)` 是否有效，再调用它，最后只执行一次 D 写入。bias 按列广播：行不同、列相同的输出读取同一个 `bias[col]`，不是读取一个 M×N 的 bias 矩阵。
+
+取 `acc=4、alpha=0.75、C_old=2、beta=-0.25、bias[col]=-1`，顺序是 `3 → 2.5 → 1.5 → 1.5`；取 acc=-4 时，最终 ReLU 输出为0。普通三步链则先把 `alpha·acc+beta·C_old` 写入 D，再由 bias kernel 读改写 D，再由 ReLU kernel 读改写 D。下面是实际调用关系，省略了逐次 launch 错误检查：
+
+```cuda
+launch(p, stream);                       // 普通 GEMM，读取固定 C_old
+bias_kernel<<<blocks, 256, 0, stream>>>(p);
+relu_kernel<<<blocks, 256, 0, stream>>>(p);
+
+// 融合对照：Persistent=false, Packed=false, Fast=true,
+//           UseBeta=true, Bias=true, Relu=true
+launch<Base, false, false, true, true, true, true>(p, stream);
+```
+
+两条路径每次都从同一个 C_old 开始，不读取上一次的 D 作为残差，所以多次计时仍在算同一问题。若把 c 和 d 随意指向同一块存储，虽然某些库允许特定 in-place 情况，本教学程序的输入约定和重复计时语义就不再成立。
+
+融合还改变了中间舍入位置，不能要求逐位一致。这里的测试输入为有限数；`fmaxf(x,0)` 对 NaN 的处理也未必与某个框架的激活语义一致，扩展到通用算子时应明确 NaN、无穷大和数据类型的约定。
+
+#### 13.7.2 利用已有标量参数与共同输入
+
+完整 GEMM 本身就支持 `αAB+βC`。当数学语义允许时，可以直接将残差作为 C 输入，或在 β=0 的路径省掉旧 C 的读取，而不是另开一个加法 kernel。`torch.empty` 输出也无需为了 β=0 的 GEMM 先清零，前提是 kernel 会覆盖所有有效输出。
+
+共同输入还允许代数重组。例如三个投影：
+
+```
+Q = XWq，K = XWk，V = XWv
+可以写成： [Q K V] = X [Wq Wk Wv]
+```
+
+这里把三个权重沿列方向拼接，改成一个更宽的 GEMM。它增加了输出任务规模，也提供了复用 X 的机会；若权重已预先按这个布局存储，就无需每次拼接。代价是权重布局、输出切片和后续消费方式要配合，融合后也未必比三次已高度优化的调用更快。
+
+共同权重时同样可以把多个输入沿 M 方向堆叠：`[A0; A1]B = [A0B; A1B]`。**有共同操作数，才有这样的直接合并机会**；两组完全独立的 A/B 不能随意拼成一个普通 dense GEMM，否则会计算多余的交叉乘积。
+
+这些变换在代数上等价，浮点实现却可能因求和顺序、融合位置和中间舍入不同而产生差异，仍需按目标精度验证。
+
+**QKV 示例怎样在代码中避免额外拼接？** `run_batches` 提前准备一个 N=105 的宽问题，三次普通投影各取35列：
+
+```cuda
+for (int i = 0; i < 3; ++i) {
+    Problem view = projection.p;
+    view.n = 35;
+    view.b += i * 35; view.c += i * 35;
+    view.d += i * 35; view.bias += i * 35;
+    launch(view, control);
+}
+// 合并对照，直接处理原来的105列：
+launch(projection.p, control);
+```
+
+这里输入 M=17、K=49，宽 B 的 ldb=110、宽 D 的 ldd=114。追踪第二个投影 i=1 的局部 B[2][1]：基址先偏移35列，再加 `2×110+1`，得到相对原 B 的偏移256，即原 B[2][36]。若把 view.ldb 改成35，偏移会变成106，读的就不再是原矩阵第二行。
+
+输出同理，第二个投影的 D[3][1] 写入原 D 的 `35+3×114+1=378`，对应原 D[3][36]。**view.n 改变逻辑宽度，指针改变子矩阵起点，leading dimension 保留原存储跨度。** 三者各司其职。
+
+以 Base 为例，三次投影各产生1个输出 tile，合并后产生2个 tile：单次调用变宽了，但总 tile 数从3减到2，减少了部分边缘空算。A 的请求复用与缓存行为也会改变，所以仍需实测。这组实验假定拼接权重已经准备好，若每次调用前再用一个 kernel 拼接，必须把那笔成本加回来。
+
+### 13.8 Batched 与 Grouped GEMM：把许多小问题一起交给 GPU
+
+上一节可以直接合并共同输入；若矩阵乘彼此独立，则使用批处理来增加并行任务并摊销调用成本。假设有 100 个独立的小 GEMM，每个只有 4 个输出 tile：
+
+```
+逐个调用：4 个 tile → 4 个 tile → ...     每次都很难占满 GPU
+一起调度：400 个 tile 进入同一批工作       可以在多个矩阵间分配 Block
+```
+
+常见接口分三类：
+
+| 输入特点 | 适合的组织方式 | 需要提供什么 |
+|----------|----------------|--------------|
+| 同形状、同布局，矩阵间距固定 | Strided Batched GEMM | 基址、leading dimension、batch stride、数量 |
+| 同形状、同布局，地址不规则 | Pointer-array Batched GEMM | 每个矩阵的指针数组 |
+| 不同组的 M/N/K 或相关参数不同 | Grouped GEMM | 问题描述、各组参数与矩阵地址 |
+
+Strided Batched 可以省掉构建和上传指针数组的工作；Grouped 则将不同问题的 tile 汇集起来，具体允许混合哪些 dtype、布局和 epilogue 由接口决定，不能把所有异构 GEMM 都塞进任意一个 grouped kernel。
+
+**Grouped 的关键是按工作量而非矩阵个数平衡。** 两个输出 tile 大小相同，K=128 与 K=4096 的主循环工作量仍相差很大。CUTLASS 的 grouped scheduler 会让持久化 Block 在多个问题间领取 tile；排序、按相近形状分桶或更动态的调度，有助于避免某些 Block 连续拿到长 K 任务。
+
+代价是读取问题元数据、查找 tile 所属矩阵以及调度的开销。为等待凑满 batch 而增加请求延迟，也可能不符合在线服务的目标。批处理增加的是**整体并行度和调用摊销**，不会自动把每个小矩阵的算术强度变成大矩阵的水平；要同时观察吞吐和单请求延迟。
+
+#### 13.8.1 Strided Batched 代码：先选矩阵，再选矩阵内的 Tile
+
+`batched_kernel` 用 z 维表示 batch，x 维表示该矩阵的输出 tile。每个矩阵都拥有独立的 A/B/C/D，矩阵间距保存在 `BatchStrides` 中：
+
+```cuda
+Problem batch_problem(Problem p, BatchStrides s, int batch) {
+    p.a += batch * s.a; p.b += batch * s.b; p.c += batch * s.c;
+    p.d += batch * s.d; p.bias += batch * s.bias;
+    return p;
+}
+
+// batched_kernel 内：
+const Problem p = batch_problem(base, strides, blockIdx.z);
+const int nt = ceil_div(p.n, T::BN);
+const int m0 = (blockIdx.x / nt) * T::BM;
+const int n0 = (blockIdx.x % nt) * T::BN;
+T::template compute<false, true>(p, m0, n0, 0, ceil_div(p.k, T::BK), smem, acc);
+T::template store<true, false, false>(p, m0, n0, acc);
+```
+
+第一段省略了 CPU/GPU 修饰符。批处理只是把 p 的基址推进到第 batch 个矩阵，后面的计算核心完全不需要知道自己来自哪个 batch。
+
+驱动的实际例子是8个 `(M,N,K)=(33,65,49)`：
+
+| 矩阵 | 行跨度 | 相邻矩阵的元素间距 |
+|------|--------|--------------------|
+| A | lda=52 | 33×52=1716 |
+| B | ldb=70 | 49×70=3430 |
+| C_old | ldc=72 | 33×72=2376 |
+| D | ldd=74 | 33×74=2442 |
+
+第3号矩阵（从0编号）的 B[2][4] 偏移为 `3×3430+2×70+4=10434`。如果误用逻辑元素数 `49×65=3185` 作为 batch stride，就会少推进 `3×49×5=735` 个元素，把前一个矩阵的尾部混进来。
+
+每个问题使用 Base 时有2个输出 tile，因此启动 `grid=(2,1,8)`，总共16个 Block；对照组是同一 stream 里的8次普通 launch，每次2个 Block。批处理不需要跨 batch 同步，但输出区域必须互不重叠。这里所有维度为正，源码也假定 bias 指针有有效分配；推广接口时应单独处理空问题和可选指针。
+
+#### 13.8.2 Grouped 代码：一个全局编号怎样定位到不同大小的问题？
+
+异构分组无法用固定 batch stride，需要每个问题各自的 `Problem` 描述符。host 先计算每个问题的输出 tile 数，并生成前缀和：
+
+```cpp
+std::vector<int> prefix{0};
+for (const auto& p : problems)
+    prefix.push_back(prefix.back() + tile_count<Base>(p));
+// problems 和 prefix 随后上传到 GPU
+```
+
+配套代码的五个问题按原顺序为：
+
+| 问题 g | M×N×K | Base tile 数 | 全局 tile 编号区间 |
+|--------|-------|-------------|-------------------|
+| 0 | 17×33×129 | 1 | [0,1) |
+| 1 | 65×31×7 | 2 | [1,3) |
+| 2 | 33×97×65 | 2 | [3,5) |
+| 3 | 64×64×32 | 1 | [5,6) |
+| 4 | 1×9×3 | 1 | [6,7) |
+
+所以 `prefix=[0,1,3,5,6,7]`。GPU 上的持久化 Block 获得 id 后，执行：
+
+```cuda
+for (int id = blockIdx.x; id < prefix[count]; id += gridDim.x) {
+    const int g = find_problem(id, prefix, count);
+    const Problem p = problems[g];
+    const int local = id - prefix[g], nt = ceil_div(p.n, T::BN);
+    const int m0 = (local / nt) * T::BM, n0 = (local % nt) * T::BN;
+    T::template compute<false, true>(p, m0, n0, 0, ceil_div(p.k, T::BK), smem, acc);
+    T::template store<true, false, false>(p, m0, n0, acc);
+    __syncthreads();
+}
+```
+
+`find_problem` 找满足 `prefix[g]<=id<prefix[g+1]` 的 g，源码去掉 CPU/GPU 修饰符后是：
+
+```cpp
+int find_problem(int tile, const int* prefix, int count) {
+    int lo = 0, hi = count;
+    while (lo + 1 < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (prefix[mid] <= tile) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+```
+
+lo 指向起点不大于目标编号的问题，hi 是上侧边界；每次比较一个中点，直到两者相邻。对 id=4，初始 lo=0、hi=5：先看 mid=2，prefix[2]=3≤4，lo 移到2；再看 mid=3，prefix[3]=5>4，hi 移到3，最终返回g=2。它要求 tile 属于 `[0,prefix[count])`，这个条件由外层循环保证。
+
+接着 local=`4-3=1`，该问题 nt=2，得到 `(m0,n0)=(0,64)`，正好是 33×97 输出的右侧 tile，只有列64~96有效。若直接把全局 id=4 除以这个问题的 nt，就会算到完全错误的块行——**全局任务编号必须先减去所属问题的起点**。
+
+所有线程使用同一个 id 与 Problem，因此能一致进入公共计算中的栅栏；不同 Block 则可以同时处理不同的 M/N/K。元数据必须在启动前准备好，并保持到 kernel 完成；按不同问题的数据类型混合调度不在这个 fp32 实例的能力范围内。
+
+#### 13.8.3 K 排序到底改变了哪些任务？
+
+源码用 `std::stable_sort` 按 p.k 递减排列**完整 Problem 对象**，然后重新计算 prefix。排序后顺序为原问题 `0、2、3、1、4`，新前缀和为 `[0,1,3,4,6,7]`。
+
+为看清负载，显式指定3个 worker，按每个 tile 的 `ceil(K/16)` 轮数作简化工作量：
+
+| worker | 原顺序的任务及轮数 | 总轮数 | K 排序后的轮数 | 总轮数 |
+|--------|-------------------|--------|----------------|--------|
+| 0 | id 0/3/6：9+5+1 | 15 | id 0/3/6：9+2+1 | 12 |
+| 1 | id 1/4：1+5 | 6 | id 1/4：5+1 | 6 |
+| 2 | id 2/5：1+2 | 3 | id 2/5：5+1 | 6 |
+
+总工作量始终是24轮，最长任务链从15轮降到12轮。这个例子说明排序可能如何改善负载，不能直接推出1.25倍真实加速，因为边界、缓存和调度还有成本。排序也不总有益，所以驱动同时测原顺序与排序后的版本。
+
+最容易出错的是只移动 M/N/K 而没有移动指针，或排序后继续用旧 prefix。代码把维度、跨度、标量和所有指针作为一个对象移动，输出仍写回各问题原来的 D，不需要再做一次输出重排。
+
+运行 `./gemm_advanced --demo batch --workers 3`，可以对应这组固定的异构问题。`batch` 的测试形状独立于单矩阵 `--m/--n/--k` 参数。
+
+### 13.9 指令与编译期特化：让循环只保留真正变化的部分
+
+第 2.9 节提醒过，SM 还要为地址计算、分支和循环控制发射指令。结构优化完成后，可以继续检查这些非乘加工作。
+
+一个典型例子是地址推进。以行主序的子块为例，初始位置只算一次，然后每轮加固定偏移：
+
+```cuda
+const float* aTile = A + static_cast<size_t>(m0) * lda;
+const float* bTile = B + n0;
+for (int t = 0; t < K; t += BK) {
+    // 从 aTile / bTile 协作搬运，完成本轮矩阵乘
+    if (t + BK < K) {             // 有下一块时再推进
+        aTile += BK;
+        bTile += static_cast<size_t>(BK) * ldb;
+    }
+}
+```
+
+这里用 fp32 指针示意递增写法；配套 `Tile::compute` 使用 tile_k/k0 表达相同的 K 段推进。编译器可能已经把乘法索引化成这样的递增形式，所以收益要通过 PTX/SASS 验证，而不是仅凭源码短了几行判断。其他常见做法包括：
+
+- **用模板固定 tile、布局和阶段数**：让取模、除法、索引组合和分支在编译期简化；
+- **专门处理 β=0、无 bias、整齐维度等常见路径**：避免每个线程在热点循环中反复判断；
+- **适度展开小循环**：帮助寄存器索引静态化和指令调度；过度展开大 K 循环会增加代码体积与指令缓存压力；
+- **缩短临时变量的活跃范围**：数据用完就让其寄存器可复用，在不破坏预取距离的前提下降低压力；
+- **对真实不重叠的指针使用 `__restrict__`**：帮助编译器消除别名顾虑，前提是调用方确实满足不重叠约定。
+
+检查 `ptxas` 报告中的寄存器、spill 和 shared 使用量，再看 SASS 中的加载宽度、整数指令和计算指令。可以尝试 `__launch_bounds__` 等资源约束，但强行压低寄存器上限可能把数据溢出到 local memory，结果比低 occupancy 更慢。**编译器提示是表达已知条件的工具，不是独立的加速开关。**
+
+#### 13.9.1 结合模板看：哪些分支能在编译时消失？
+
+公共核心同时有两类条件，含义不同：
+
+```cuda
+if constexpr (Packed) {
+    smem.b[ix] = p.b[packed_b_index(n0 / BN, tile_k, r, c,
+                                   ceil_div(p.k, BK), BK, BN)];
+} else {
+    smem.b[ix] = (full || (k0 + r < p.k && n0 + c < p.n))
+        ? p.b[static_cast<std::size_t>(k0 + r) * p.ldb + n0 + c] : 0.0f;
+}
+```
+
+Packed 是模板布尔值，每个编译实例只保留一个分支；full 与具体问题和当前 tile 有关，仍是运行期判断。两者不能因为都写着 if 就认为成本相同。
+
+同理，Base 中 `BN/TN=16`，线程定位的除法/取模通常可以化简为移位和掩码；TM=TN=4，编译器知道总共16个累加值，小循环展开后可以为不同下标安排寄存器。如果把这些量全部改成运行期变量，动态数组索引和循环控制可能更难优化。
+
+β=0 特化更直观：`epilogue<false,...>` 在编译时去掉 C_old 读取。驱动为这个版本设置 `zero.c=nullptr`，同时让参考计算不包含 β 项。只在 host 把 beta 值设为0，却仍执行通用的 `p.beta * p.c[...]`，并不等价于保证 C 指针可以为空。
+
+#### 13.9.2 展开和寄存器：怎样从代码变化推测代价？
+
+`compute` 只展开 BK=16 和 TM/TN 的小循环，外层 K 段循环仍按问题大小推进。这样使一次小块计算比较容易优化，又避免把 K=4097 的所有迭代都复制到机器码中。
+
+Base 每线程持有16个 acc，Wide 持有32个；这只是累加器值的数量，真实寄存器数还包含 ra/rb、地址、谓词等，也受编译器活跃范围安排影响。若为了“多条独立累加链”一口气增大线程 tile，可能同时增加 spill，将本应留在寄存器里的值搬到 local memory。
+
+可以在 `code/advanced/` 下观察实际编译结果：
+
+```bash
+nvcc -std=c++17 -O3 -lineinfo -arch=sm_80 -Xptxas=-v gemm_advanced.cu -o gemm_advanced
+cuobjdump --dump-sass gemm_advanced
+```
+
+先从 `ptxas` 输出看各模板实例用了多少寄存器、有没有 spill，再定位热点循环里的整数指令、shared 加载和 FMA。源码中的相同表达式有时已经被公共子表达式消除；反过来，一句看似简单的动态索引也可能生成不少指令。**只有发现实际机器码中的开销，再决定是否改变表达方式**，不要把手工移位、限制寄存器或全面展开当成必选步骤。
+
+### 13.10 自动调优：把互相牵制的参数交给实测选择
+
+到这里，影响 GEMM 的参数已经不止 BM/BN/BK：还有 Warp Tile、线程数、流水级数、Split-K 因子、调度顺序和 epilogue。它们相互影响，通常不存在一个配置在所有形状上都最好。
+
+自动调优不是盲目枚举所有组合，而是先用前面的分析缩小候选，再实测：
+
+```text
+给定 M/N/K、dtype、布局、对齐、epilogue 和 workspace 预算
+  ① 排除硬件不支持、shared/寄存器需求不合适的组合
+  ② 按形状挑选少量 tile 与调度候选
+  ③ 做正确性校验与预热
+  ④ 多次计时，选择稳定较快的方案
+  ⑤ 缓存结果，后续相同条件直接复用
+```
+
+在库接口层，`cublasLtMatmulAlgoGetHeuristic` 可按问题描述和偏好返回候选算法，顺序依据**估计**耗时；用户可以在 workspace 预算内测试多个候选。CUTLASS profiler 及 GEMM heuristics 提供了类似的候选筛选和测量入口，具体支持范围取决于版本与硬件。
+
+缓存键也要足够完整：除了 M/N/K，还应包含 dtype、累加模式、transpose/layout、leading dimension、指针对齐类别、batch 信息、epilogue、workspace 限制和设备环境。库或 GPU 变化后，旧选择未必仍有效。
+
+最后要选对目标：固定权重反复使用时，热缓存可能符合真实场景；每次输入都很大且不同，反复测同一指针却可能高估 L2 收益。β 非零且原地更新 C 时，还应安排一致的初始输入，避免候选算法测到不同的累加状态。存在精度转换、打包或归约时，既记录 kernel 时间，也记录完整调用时间。**自动调优替代的是经验猜参数，不替代对工作负载的定义。**
+
+#### 13.10.1 调参代码：候选、计时和缓存不是同一件事
+
+`launch_candidate` 只负责选择已编译的三个内核：
+
+```cuda
+if (id == 0) launch<Small>(p, stream);
+else if (id == 1) launch<Base>(p, stream);
+else launch<Wide>(p, stream);
+```
+
+`tune` 先查询缓存。示例的键固定为设备编号、M/N/K 和四个跨度：
+
+```cpp
+const TuneKey key{device, p.m, p.n, p.k, p.lda, p.ldb, p.ldc, p.ldd};
+if (const auto it = cache.find(key); it != cache.end())
+    return it->second;
+```
+
+默认问题在设备0上的键是 `(0,129,193,65,68,198,200,202)`。相同逻辑尺寸若变成紧密存储，跨度变了，就不是同一个键。缓存里保存的是候选编号，不是输入数据或输出结果，后续输入内容可以变化。
+
+未命中时，每个候选先经 `report` 验证，然后收集三组计时：
+
+```cpp
+const auto invoke = [&, i] { launch_candidate(i, p, stream); };
+std::vector<float> samples{
+    report("tune-candidate-" + std::to_string(i), f, invoke, stream, iters),
+    time_gpu(invoke, stream, iters),
+    time_gpu(invoke, stream, iters)
+};
+std::sort(samples.begin(), samples.end());
+const float ms = samples[1];
+if (ms < best) { best = ms; selected = i; }
+// 全部候选测完后：cache.emplace(key, selected)
+```
+
+第一项并非只计时：`report` 会初始化输出、运行一次、同步、检查数值与 padding，再进入 `time_gpu`。错误配置不会因为碰巧很快而进入缓存。
+
+#### 13.10.2 用一组示意时间解释中位数和缓存边界
+
+假设三次计时批次的平均时间如下，仅用于解释选择逻辑：
+
+| 候选 | 三次平均时间（ms） | 中位数 |
+|------|--------------------|--------|
+| Small | 0.081、0.080、0.110 | 0.081 |
+| Base | 0.070、0.071、0.069 | 0.070 |
+| Wide | 0.066、0.090、0.089 | 0.089 |
+
+选择 Base，而不是拥有最低单次值0.066的 Wide。中位数降低了单次异常值的影响，但三组测量不构成严格的统计保证；真正部署还要考虑并发、频率、缓存状态和工作负载权重。
+
+示例把 dtype、普通 epilogue、标量加载对齐条件及 α/β 使用方式固定，所以缓存键可以较小。若以后把 Packed、Bias、Relu 或 workspace 策略也纳入候选，就必须把这些条件加入键，否则可能拿“未打包 B 的最快配置”去读取已打包数据，问题会从性能退化成正确性错误。
+
+驱动会对同一个问题连续调用两次 `tune`，第二次应打印 cache hit；再调用已选择内核并重新验证结果。`--check-suite` 中 iters=1 只用于验证这条流程，正式比较应增加迭代数并检查重复测量是否稳定。
+
+### 13.11 调用层优化：让 GPU 少等下一份工作
+
+如果 Nsight Systems 显示 GEMM 很短、kernel 之间空隙很长，继续改 MMA 主循环往往收益很小。先减少重复管理工作：
+
+- 复用 cuBLAS handle、算法选择、Tensor Map 和 workspace，避免每次创建、分配、销毁；
+- 数据尽量在 GPU 上连续消费，避免在相邻算子之间反复往返 CPU；
+- 同一 stream 中已有执行顺序时，通常不需在每个 kernel 后让 CPU 等待；跨 stream 的依赖用事件等机制表达；
+- 少量独立且单独无法占满 GPU 的任务，可以尝试多 stream 并行；已经跑满资源的大 GEMM 并发执行，可能只是互相争带宽和缓存。
+
+对重复执行的固定调用链，还可以使用 **CUDA Graphs**：先记录 kernel、拷贝及依赖并实例化，之后一次 replay 提交整段工作。
+
+```
+逐次提交： CPU 发 GEMM → CPU 发 bias → CPU 发 activation → ...
+Graph：    CPU 提交已准备好的图 → GPU 按依赖执行各节点
+```
+
+Graph 减少的是提交和调度开销，**不会自动把这些 kernel 融合，也不会消除中间数组的访存**。因此它与 13.7 节的融合可以叠加：先优化链路中的工作，再降低重复提交成本。
+
+构图、实例化和首次运行有成本，必须通过重复执行摊销。图中使用的地址和资源要保持有效；形状、指针或依赖变化时，要采用支持的更新机制或重新准备图。对一次性大 GEMM，构图的收益可能很小；对反复执行的短 GEMM 链，更值得测量。
+
+#### 13.11.1 Graph 代码：捕获的是参数与依赖，不是计算结果
+
+`graph` demo 使用与融合对照相同的三步链，但这里保留三个 kernel，单独考察提交方式。以下是驱动中的主线，省略错误检查：
+
+```cuda
+unfused_chain(p, stream);                // 先预热、加载模块
+cudaStreamSynchronize(stream);
+Graph graph;                            // RAII 对象，持有 graph 与 executable graph
+cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+unfused_chain(p, stream);                // GEMM → bias → ReLU，同一 stream 上的依赖
+cudaStreamEndCapture(stream, &graph.graph);
+cudaGraphInstantiate(&graph.exec, graph.graph, nullptr, nullptr, 0);
+auto replay = [&] { CUDA_CHECK(cudaGraphLaunch(graph.exec, stream)); };
+```
+
+预热在 capture 之前完成，内存、描述符和输出都已准备好。capture 记录要执行的操作及其参数，instantiate 创建可重复提交的实例；随后每次 replay 仍会实际重新读取输入、做乘法和写结果。
+
+这里 `Problem` 按值作为 kernel 参数传入，所以图中保存了当时的尺寸、跨度、标量及指针值。**在原地址上更新 A/B 内容，并在执行顺序上保证更新完成，可以让 replay 处理新数据；只在 host 上把 `p.a` 改成另一个地址，不会自动修改已经实例化的图。** 后者需要相应节点更新或重新构图。释放旧 allocation 后仅保留一个同名指针变量，也不能保证图仍可用。
+
+Graph 对象在所有计时完成后先销毁，再释放 Fixture 中的输入输出，这样图引用的地址在整个生命周期内都有效。构图时间单独报告，replay 时间不包含它；是否值得用，仍要看重复次数能否摊销。
+
+#### 13.11.2 多 Stream 代码：为什么循环里等待 done 不会立即阻塞 CPU？
+
+`batch` 的多 stream 对照使用一个 control stream 计时，其他流执行独立 GEMM：
+
+```cuda
+cudaEventRecord(gate.value, control);
+for (int i = 0; i < count; ++i) {
+    cudaStreamWaitEvent(streams[i]->value, gate.value, 0);
+    launch(batch_problem(base, strides, i), streams[i]->value);
+    cudaEventRecord(done[i]->value, streams[i]->value);
+    cudaStreamWaitEvent(control, done[i]->value, 0);
+}
+```
+
+逐行看依赖：
+
+1. gate 排在 control 已有工作之后，因此工作流不能越过本批起点。
+2. 每个工作流等待同一个 gate，随后计算自己的矩阵，输出地址互不重叠。
+3. done 排在各自 GEMM 后面，表示该流这次工作完成。
+4. control 等待所有 done，后面记录的停止事件才代表整批结束。
+
+`cudaStreamWaitEvent` 是向 GPU 流中加入等待依赖，不是让 CPU 当场停下。因此虽然 host 循环在提交第 i 个任务后就给 control 加一个等待，CPU 仍可继续提交第 i+1 个工作流，独立 GEMM 仍有重叠机会。
+
+假设三个独立任务在无资源争用时分别耗时4、7、5个时间单位，理想并行链的最长部分是7，而串行是16；实际还要加事件协调和资源竞争的成本。若没有最后的汇合，control 的停止事件甚至可能在任务没算完时就发生，测到的时间就失去意义。
+
+gate/done 对象在多次批处理之间复用，每次都先 record 再建立本批依赖；不能等待尚未按预期记录的事件来猜测未来完成。程序使用非默认 stream，数据准备阶段也显式保证上传完成，不依赖默认流的隐式顺序。
+
+#### 13.11.3 同一计时函数，为什么不同 demo 的统计范围不同？
+
+驱动的 `time_gpu` 接收一个回调 fn：
+
+```cuda
+Event start, stop;
+for (int i = 0; i < 2; ++i) fn();
+cudaStreamSynchronize(stream);
+cudaEventRecord(start.value, stream);
+for (int i = 0; i < iters; ++i) fn();
+cudaEventRecord(stop.value, stream);
+cudaEventSynchronize(stop.value);
+float ms = 0;
+cudaEventElapsedTime(&ms, start.value, stop.value);
+return ms / iters;
+```
+
+事件创建、预热与预热同步在区间外；fn 的内容决定一次操作包含什么：
+
+| fn 的内容 | 一次时间代表什么 |
+|-----------|------------------|
+| 一次普通 launch | 一个完整 GEMM |
+| Split-K 部分和 launch + 归约 launch | 两阶段合计，不是只算矩阵乘部分 |
+| pack + packed GEMM | 每次重打包后的完整开销 |
+| 只做 packed GEMM | 权重已准备好的稳态开销 |
+| 8个流的扇出、计算与汇合 | 整个 batch，包括事件协调 |
+| 一次 graph replay | 三节点链的执行与可能的提交间隙，不含构图 |
+
+CUDA events 测量的是流上两个事件之间经过的 GPU 时间；若 fn 很短、CPU 来不及连续提交，GPU 在事件区间内等待下一条工作的空隙也会进入结果。Graph demo 因此还用 `steady_clock` 包住整批 host 提交与最终同步，报告墙钟时间。
+
+`report` 的输出初始化和数值校验在正式计时之前，调参搜索、host Stream-K 计划及 workspace 分配也不混入稳态值。要评价一次性调用或动态输入场景，则还需另外合计这些成本。**先写清楚 fn 表示的工作，再比较两个 ms 数字**，这是比增加计时轮数更先要做的事。
+
+### 13.12 把这些手段放回同一张优化地图
+
+前文的主线是"把数据留在更快的存储中"，本章补上的是"让任务与数据流适合整个 GPU"。可以按观察到的瓶颈选择下一步：
+
+| 现象 | 优先尝试 | 主要代价或边界 |
+|------|----------|----------------|
+| 边缘 tile 大量空算 | 非方形/较小 tile、边缘特化 | 局部复用下降，路径变多 |
+| M/N 小、K 很长，SM 闲置 | Split-K | 部分和空间、流量与归约 |
+| 只有少数完整 tile 拖尾 | 重新选 tile、Stream-K | 更复杂的调度与部分和合并 |
+| 多个任务耗时不均 | Persistent 调度、Grouped 分桶/排序 | 任务领取与元数据开销 |
+| Block 间输入重复读，HBM 压力大 | Block Swizzle、L2 局部性 | 工作集容量与缓存竞争 |
+| 转置/格式转换反复执行 | 布局直接支持、预打包 | 额外副本与更新成本 |
+| 输出被多轮读改写 | Epilogue 融合、利用 α/β | 寄存器压力、布局和接口限制 |
+| 大量独立小 GEMM | Batched / Grouped、共同输入重组 | 元数据、batch 等待延迟 |
+| 非计算指令或 spill 较多 | 编译期特化、调整展开与活跃范围 | 代码体积与资源权衡 |
+| 不同形状最优参数差别大 | 启发式筛选 + 自动调优 | 搜索、缓存与维护成本 |
+| GPU 常等提交，短 kernel 间有空隙 | 资源复用、减少同步、CUDA Graphs | 构图摊销与动态更新 |
+
+还有一些收益很大的方向，但它们依赖额外的数值或数据条件：**低精度/量化**可以减少权重字节数或使用更快的计算路径，必须计入 scale、转换、反量化和误差；**结构化稀疏**可以跳过符合特定模式的乘法，前提是数据满足模式且采用相应格式与硬件路径。普通 dense GEMM 中仅有一些零值，并不会自动省掉乘加。这些不能当作保持任意输入和数值语义不变的通用开关。
+
+最重要的实践顺序是：**先确定瓶颈尺度，再改变一个组织层次，最后用端到端时间确认收益**。共享内存、Tensor Core、TMA、Split-K、融合都只是手段；真正的目标始终是减少完成这份工作所需的时间。
+
+### 13.13 代码实践：把优化方向落实到同一套计算核心
+
+前面的算法小节已经逐步走过关键代码，本节把运行入口和检查方法集中起来。代码位于 [`code/advanced/`](code/advanced/README.md)，其中 `kernels.cuh` 放计算与调度 kernel，`schedule.h` 放公共索引，`gemm_advanced.cu` 负责初始化、调用、校验和计时。
+
+为了看清每次改动的作用，这套代码采用 **fp32 输入与累加、普通共享内存分块**，再改变 tile 形状、任务映射、数据布局或写回逻辑。它与 V7 的 WMMA 示例各有侧重：这里主要验证第 13 章的组织方法，Tensor Core 和 TMA 可以在掌握这些方法后再与之组合。
+
+#### 13.13.1 先跑起来：每种结果都与 CPU 参考核对
+
+在 `01_gemm/code/advanced/` 目录下，用 CUDA Toolkit 12+ 编译，架构选项按目标 GPU 调整：
+
+```bash
+nvcc -std=c++17 -O3 -lineinfo -arch=sm_80 gemm_advanced.cu -o gemm_advanced
+./gemm_advanced --check-suite
+./gemm_advanced --demo all --m 129 --n 193 --k 65 --iters 20
+```
+
+默认计算 `D = 0.75·AB - 0.25·C_old`，融合版本再加列 bias 并做 ReLU。`C_old` 与 D 分开分配、在重复计时中保持不变——否则 β 非零时，每跑一次结果都继续累加，就不再是同一份工作。
+
+驱动还故意使用四种不同的跨度：`lda=K+3、ldb=N+5、ldc=N+7、ldd=N+9`。输入和输出的行尾 padding 填 NaN，CPU 参考只读取有效矩阵区域；每个版本既检查数值，也检查 D 的 padding 没有被覆盖。这样可以同时暴露漏写、错用 leading dimension 和边缘处理错误。
+
+| 命令选择 | 主要代码 | 对应优化方向 |
+|----------|----------|--------------|
+| `--demo core` | `Tile::compute`、`gemm_kernel` | 形状、内部快路径、Block Swizzle、Persistent、β=0 特化 |
+| `--demo split` | `split_k_kernel`、`split_reduce_kernel`、`sliced_k_kernel` | 跨 Block / Block 内的 K 分片 |
+| `--demo streamk` | `make_streamk_plan`、`streamk_partials_kernel` | 工作量均分与分段结果归约 |
+| `--demo packed` | `pack_b_kernel`、`compute<Packed=true>` | B 预打包、补零与回本计算 |
+| `--demo fusion` | `epilogue`、`unfused_chain` | 三次调用与一次融合写回 |
+| `--demo batch` | `batched_kernel`、`grouped_kernel`、`run_batches` | 批处理、分组、K 排序、多 stream 与 QKV 合并 |
+| `--demo tune` | `tune`、`launch_candidate` | 候选实测与配置缓存 |
+| `--demo graph` | `unfused_chain`、Graph capture/replay | 相同三节点工作链的提交优化 |
+| `--demo cache` | `cudaStreamSetAttribute` 调用部分 | L2 持久化访问偏好 |
+
+这张表也是阅读顺序：先看 `core`，后面的方向都尽量复用它的计算部分。
+
+#### 13.13.2 按源码函数定位对应的推导
+
+| 阅读的源码 | 回到正文看什么 | 可以自己手算的检查点 |
+|------------|----------------|----------------------|
+| `Tile::compute/store` | 13.2.3~13.2.4、13.6.1 | 线程37搬入哪些数、更新哪个输出、K尾部怎样补零 |
+| `partition`、`split_k_kernel` | 13.3.3~13.3.4 | K=65如何分成三段，partial与D的跨度为何不同 |
+| `sliced_k_kernel` | 13.3.5 | 线程137的部分和为什么由线程201归约 |
+| `gemm_kernel` 持久化循环 | 13.4.1 | 12个tile分给5个Block时是否恰好覆盖一次 |
+| `make_streamk_plan`、两个Stream-K kernel | 13.4.3~13.4.5 | 15个工作单位怎样变成6个slot，再还原三个输出tile |
+| `tile_coord`、L2窗口设置 | 13.5.1~13.5.2 | 最后一组只有一行时，id=13怎样映射 |
+| `pack_b_kernel`、`packed_b_index` | 13.6.3~13.6.4 | B[17][67]怎样从源偏移1342搬到目标偏移3139 |
+| `epilogue`、`unfused_chain`、QKV子视图 | 13.7 | α/β/bias只加一次，子矩阵为什么保留大矩阵跨度 |
+| `batch_problem`、`grouped_kernel`、`find_problem` | 13.8 | batch stride包含什么，id=4属于哪个异构问题 |
+| `launch_candidate`、`tune` | 13.9~13.10 | 编译期开关与运行期条件的区别，中位数如何选候选 |
+| capture/replay、事件扇出汇合、`time_gpu` | 13.11 | 停止事件能否证明整批完成，计时包括哪些工作 |
+
+读代码时可以先只盯一个输出元素：它的输入坐标是什么、由谁累加、部分和暂存在哪里、最终谁写回。确认这一条路径后，再检查所有线程和所有 tile 是否构成无重叠、无遗漏的覆盖。这样比一次追踪整个矩阵更容易发现索引错误。
+
+#### 13.13.3 怎样验证这些实现
+
+```bash
+# GPU：数值、非整齐尺寸、行跨度、输出 padding 与各种组合
+./gemm_advanced --check-suite
+./gemm_advanced --check-suite --workers 1 --split 64 --group-rows 64
+./gemm_advanced --check-suite --workers 100 --split 3 --group-rows 3
+compute-sanitizer --tool memcheck ./gemm_advanced --check-suite
+
+# CPU：没有 CUDA 环境也能验证公共索引与任务计划
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic schedule_test.cpp -o schedule_test
+./schedule_test
+```
+
+GPU 驱动的参考使用 double 累加，并采用绝对误差、相对误差和输入乘积量级共同构成的容差，以容纳不同 fp32 求和顺序；不是要求逐位一致。`--check-suite` 的计时迭代数只有 1，用来发现错误，不适合作为性能结论。
+
+具体检查在 `Fixture::check` 中。对有效输出，先根据 double 点积和固定的 C_old/bias 计算参考值，再判断：
+
+```cpp
+const double tol = 1e-4 + 2e-4 * std::abs(ref) + 2e-6 * abs_sum[ix];
+if (!std::isfinite(value) || std::abs(value - ref) > tol) {
+    // 打印输出坐标、实际值、参考值和容差，然后让程序失败退出
+}
+```
+
+其中 `abs_sum[ix]=Σ_k |A[r,k]·B[k,c]|`。参考结果接近0时，仅使用相对误差会把正常的舍入差放大；例如 ref=0、abs_sum=10，容差为0.00012，误差0.00009可以接受，0.0002则失败。这个阈值服务于本程序的随机小幅 fp32 输入，不是对任意分布、精度或病态矩阵都适用的数学保证。
+
+对行尾 `col>=N` 的位置，检查值仍是 NaN，验证写回没有越过逻辑行边界；对未写入的有效输出，NaN也会触发失败。它不能证明所有非法读取和竞争都不存在，例如激活可能改变 NaN 的表现，所以数值检查仍需配合内存与同步检查。
+
+CPU 测试检查任务是否漏算/重复、最后一个 swizzle 分组是否正确、Stream-K 各 worker 工作量是否平衡、归约是否拿对 slot，并用非整齐矩阵重建乘法结果。它不能检查设备上的共享内存竞争、异步执行和真实性能，这些仍需 GPU 校验与 profiler。
+
+完整参数、资源生命周期、计时范围以及 `racecheck/synccheck` 命令见 [`code/advanced/README.md`](code/advanced/README.md)。先确保每种组织方式独立正确，再把它们与更高性能的计算核心组合，才容易判断问题出在计算、调度还是数据交接。
+
+### 13.14 官方资料与实现入口
+
+1. [NVIDIA：Matrix Multiplication Background User's Guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html)：算术强度、tile 选择、Tile/Wave Quantization；文中具体性能图对应其标注的 GPU 与库版本。
+2. [CUTLASS：Efficient GEMM in CUDA](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html)：Split-K、Sliced-K、Block Rasterization、Persistent GEMM 与 Epilogue。
+3. [CUTLASS v3.5.1：Ampere GEMM Universal Stream-K](https://github.com/NVIDIA/cutlass/blob/v3.5.1/examples/47_ampere_gemm_universal_streamk/ampere_gemm_universal_streamk.cu)：对照普通任务划分、Split-K 与 Stream-K，并附方法论文入口；示例的具体数据/累加精度以代码为准。
+4. [CUTLASS：Grouped Kernel Schedulers](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/grouped_scheduler.html)：持久化任务分配、调度元数据与按 K 工作量改善负载平衡。
+5. [NVIDIA：cuBLAS Strided Batched Matrix Multiply](https://developer.nvidia.com/blog/cublas-strided-batched-matrix-multiply/)：批处理及减少指针数组准备成本的动机；具体接口限制应查所用版本的 cuBLAS 文档。
+6. [cuBLAS / cuBLASLt 文档（CUDA 12.6.3）](https://docs.nvidia.com/cuda/archive/12.6.3/cublas/index.html)：布局、Batched/Grouped 接口、Epilogue 支持范围、算法启发式、workspace 与 stream 行为。
+7. [CUTLASS：GEMM Heuristics](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/heuristics.html)：缩小自动调优候选空间，再用 profiler 实测选择。
+8. [NVIDIA：Getting Started with CUDA Graphs](https://developer.nvidia.com/blog/cuda-graphs/)：减少短 kernel 调用链的提交开销，以及构图成本的摊销。
+9. [CUDA C++ Programming Guide：L2 Access Management](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#device-memory-l2-access-management)：L2 持久化访问策略、容量及多 stream 共享限制。
+
+---
+
+## 第 14 章 总结与实践建议
+
+### 14.1 八个版本回顾
 
 | 版本 | 核心手段 | 解决的瓶颈 | 复用建立在哪一层 |
 |------|---------|-----------|----------------|
@@ -1828,7 +3198,7 @@ print(f"{t:.3f} ms, {tflops:.1f} TFLOPS   (cuBLAS: {bench(lambda: A @ B):.3f} ms
 | V6 | 双缓冲 | 加载与计算串行 | （时间维度的重叠） |
 | V7 | Tensor Core (WMMA) | CUDA Core 吞吐上限 | 硬件级矩阵运算 |
 
-### 13.2 关键指标演进（M=N=K=4096 量级的典型相对性能）
+### 14.2 关键指标演进（M=N=K=4096 量级的典型相对性能）
 
 | 指标 | V0 | V1 | V2 | V3 | V4 | V5 | V6 | V7(fp16) |
 |------|----|----|----|----|----|----|----|----|
@@ -1840,22 +3210,26 @@ print(f"{t:.3f} ms, {tflops:.1f} TFLOPS   (cuBLAS: {bench(lambda: A @ B):.3f} ms
 
 > \* V7 的 8 FLOP/B 对应 11.3 节的最小实现；11.5 节建立 128×128 Block Tile 复用后，输入侧才达到 64 FLOP/B。性能应与相同输入、累加和输出精度的 cuBLAS 配置比较，各版本的量级示意请以自己机器上的实测为准。
 
-### 13.3 通用优化方法论
+### 14.3 通用优化方法论
 
-GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规律：
+把 V0~V7 与第 13 章的完整工作负载优化合在一起，可以归纳出四条规律：
 
 1. **先把访存"姿势"做对，再谈复用**：合并访存（V1）是所有后续优化的地基，映射错误会淹没一切其他努力；
 2. **核心问题是"每次计算配几次访存"**：在每一级存储上建立分块，把这个比值逐级压低（V2 压 global，V4 压 smem，V5 压指令数）；分块参数的本质是**用片上资源（smem、寄存器）换访存量**，代价是占用率——ILP 充足时低占用率完全可行；
-3. **让不同硬件单元的工作在时间上重叠**：双缓冲/流水线（V6）不减少任何工作量，却能显著缩短总时间——这一思想向上延伸就是 `cp.async`、TMA、以及 kernel 间的 stream 并行。
+3. **让不同硬件单元的工作在时间上重叠**：双缓冲/流水线（V6）不减少任何工作量，却能显著缩短总时间——这一思想向上延伸就是 `cp.async`、TMA、以及 kernel 间的 stream 并行；
+4. **局部效率要与全局组织一起看**：tile 太大可能空算或任务不足，单次 GEMM 很快也可能被转换、归约和提交成本淹没。形状、缓存、任务调度与调用链，应以完整工作负载的耗时作最终判断。
 
-### 13.4 版本选择与进阶路径
+### 14.4 版本选择与进阶路径
 
 | 场景 | 建议 |
 |------|------|
 | 理解 GPU 存储层次 | 精读 V0 → V2 |
 | 理解现代 GEMM kernel 结构 | 精读 V4 → V6（三级分块 + 双缓冲） |
 | 理解 WMMA 与 32 线程协作 | 第 11.2~11.3 节，再读官方 `cudaTensorCoreGemm` |
-| 进阶：Warp Tiling / swizzle / Split-K | siboehm 博客、CUTLASS 文档 |
+| 理解形状与任务划分 | 第 13.1~13.4 节：Tile/Wave Quantization、Split-K、Persistent、Stream-K |
+| 理解缓存与链路复用 | 第 13.5~13.8 节：L2、预打包、融合、Batched/Grouped GEMM |
+| 进阶：指令、参数与调用层 | 第 13.9~13.11 节：特化、自动调优、CUDA Graphs |
+| 动手实现通用优化 | 第 13.13 节与 `code/advanced/`：公共核心、调度、打包、融合、批处理及检查 |
 | 进阶：Tensor Core 深入 | 第 11.4~11.5 节、`mma.sync` PTX、`ldmatrix`、CUTLASS CuTe |
 | 进阶：Hopper TMA / WGMMA | 第 11.6 节，再读 CUTLASS Hopper Warp Specialization 与 pipeline 文档 |
 | 生产环境 | cuBLAS / cuBLASLt / CUTLASS，融合场景用 Triton 或手写 |
@@ -1875,10 +3249,10 @@ GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规
 | TLP / ILP | 线程级 / 指令级并行，两条掩盖延迟的途径 | 第 2、7~8 章 |
 | 算术强度（AI） | FLOP 数 / 访存字节数，决定算子是 compute- 还是 memory-bound | 第 2 章 |
 | Roofline 模型 | 以 AI 为横轴、可达性能为纵轴的性能上限模型 | 第 2 章 |
-| compute-bound | 性能受限于算力而非带宽；GEMM 的理论属性 | 第 2 章 |
+| compute-bound | 性能受限于算力；GEMM 是否属于此类还取决于形状、精度和实现 | 第 2、13 章 |
 | Block Tiling | C 按 Block 分块、K 维分段，子块驻留共享内存复用 | 第 6 章 |
 | 共享内存三铁律 | 每 Block 独占一份；仅 Block 内可见；生命周期随 Block 结束 | 第 6 章 |
-| Block Swizzle | 重排 blockIdx 映射使同时运行的 Block 数据重叠，提高 L2 命中率 | 第 6 章 |
+| Block Swizzle | 重排 blockIdx 映射，改善邻近任务的数据复用与 L2 命中机会 | 第 6 章、13.5 节 |
 | Thread Block Cluster | Hopper 特性：Cluster 内 Block 同时调度、可互访共享内存（DSM） | 第 6 章 |
 | Thread Tiling | 每线程负责多个输出元素，操作数驻留寄存器复用 | 第 7~8 章 |
 | 外积累加 | 固定 k，regA×regB 的所有组合一次算完；TM×TN 次 FMA 只需 TM+TN 次 LDS | 第 8 章 |
@@ -1897,8 +3271,16 @@ GEMM 的优化过程给出三条对一切 compute-bound 算子适用的一般规
 | WGMMA | Hopper 的 128 线程 Warpgroup 级异步矩阵乘加 | 第 11.6 节 |
 | Tensor Core | 矩阵乘加硬件，支持的精度、形状与吞吐随架构变化 | 第 11 章 |
 | WMMA / fragment | 32 线程集体矩阵乘 API / 矩阵块在各线程中的局部存储，坐标映射不透明 | 第 11 章 |
-| CUTLASS | NVIDIA 开源 GEMM 模板库，本文各级分块的组件化实现 | 第 11~12 章 |
-| Split-K | K 维切给多个 Block 并行、结果归约；小 M/N 大 K 时提高并行度 | 第 13 章 |
+| CUTLASS | NVIDIA 开源 GEMM 模板库，本文分块、流水线与任务调度的组件化实现 | 第 11~13 章 |
+| Tile / Wave Quantization | tile 边缘的无效计算 / 末尾任务不足以填满一批执行槽位 | 第 13.2 节 |
+| Split-K / Sliced-K | K 维分给多个 Block / 同一 Block 内多个 Warp，最终归约部分和 | 第 13.3 节 |
+| Persistent GEMM | 一组 Block 在同一次 kernel 内连续处理多个 tile | 第 13.4 节 |
+| Stream-K | 按各输出 tile 的 K 迭代工作量划分任务，缓解负载不均 | 第 13.4 节 |
+| Prepacking | 将反复使用的输入提前转成适合计算的布局，靠复用摊销转换成本 | 第 13.6 节 |
+| Epilogue 融合 | 在 GEMM 写回前完成缩放、bias、激活等，减少中间读写 | 第 11.7、13.7 节 |
+| Batched / Grouped GEMM | 将同形状批量矩阵乘 / 多组不同形状矩阵乘一起组织执行 | 第 13.8 节 |
+| 自动调优 | 按问题与设备筛选候选、实测选择，再缓存配置 | 第 13.10 节 |
+| CUDA Graphs | 预先准备执行图并重复提交，减少调用开销，不自动融合 kernel | 第 13.11 节 |
 | PYBIND11_MODULE | 把 C++/CUDA 函数导出为 Python 模块的最简方式 | 第 12 章 |
 | TORCH_LIBRARY | PyTorch 生产级算子注册宏，接入 dispatcher 按 device 分发 | 第 12 章 |
 | AT_DISPATCH_* | 实现函数内部按 dtype 实例化模板 kernel 的宏 | 第 12 章 |
